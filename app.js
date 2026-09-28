@@ -160,6 +160,7 @@ const uid = () => 's' + Math.random().toString(36).slice(2, 9) + Date.now().toSt
 function toast(msg) {
   const t = document.createElement('div');
   t.className = 'toast'; t.textContent = msg;
+  t.setAttribute('role', 'status');
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 2200);
 }
@@ -422,13 +423,13 @@ function renderWorkout() {
   for (const d of S.days) {
     const last = lastDone(d.id);
     const exs = S.exercises.filter(e => e.day === d.id);
-    html += `<div class="card day-card ${d.id === sug ? 'suggested' : ''}" data-start="${esc(d.id)}">
-      <div>
-        <h3>${esc(d.name)} ${d.id === sug ? '<span class="pill amber">UP NEXT</span>' : ''}</h3>
-        <div class="day-meta">${exs.length} exercises · ${last ? 'last: ' + fmtDate(last) + ` (${daysAgo(last)}d ago)` : 'not logged yet'}</div>
-      </div>
-      <div class="day-arrow">›</div>
-    </div>`;
+    html += `<button class="card day-card ${d.id === sug ? 'suggested' : ''}" data-start="${esc(d.id)}">
+      <span>
+        <span class="day-title">${esc(d.name)} ${d.id === sug ? '<span class="pill amber">UP NEXT</span>' : ''}</span>
+        <span class="day-meta">${exs.length} exercises · ${last ? 'last: ' + fmtDate(last) + ` (${daysAgo(last)}d ago)` : 'not logged yet'}</span>
+      </span>
+      <span class="day-arrow" aria-hidden="true">›</span>
+    </button>`;
   }
   view.innerHTML = html;
   view.querySelectorAll('[data-start]').forEach(el => el.onclick = () => startWorkout(el.dataset.start));
@@ -723,8 +724,9 @@ function bodyCheckModal(next) {
       <button class="effort-btn" data-bc="tight">Tight</button>
       <button class="effort-btn" data-bc="pain">Bothered me</button>
     </div>
-    <textarea id="bcNote" rows="2" placeholder="Optional — where, which exercise, how bad…"></textarea>
-    <div class="btn-row" style="margin-top:14px"><button class="btn" id="bcNext">Continue</button></div>`);
+    <textarea id="bcNote" rows="2" aria-label="Neck and shoulder note" placeholder="Optional — where, which exercise, how bad…"></textarea>
+    <div class="btn-row" style="margin-top:14px"><button class="btn secondary" id="mBack">Back</button><button class="btn" id="bcNext">Continue</button></div>`, { dismissable: false });
+  $('#mBack').onclick = closeModal;
   let choice = null;
   document.querySelectorAll('[data-bc]').forEach(b => b.onclick = () => {
     choice = b.dataset.bc;
@@ -753,8 +755,9 @@ function progressionModal() {
       </div>
     </div>`;
   });
-  html += `<div class="btn-row" style="margin-top:8px"><button class="btn" id="progDone">Save workout</button></div>`;
-  modal(html);
+  html += `<div class="btn-row" style="margin-top:8px"><button class="btn secondary" id="mBack">Back</button><button class="btn" id="progDone">Save workout</button></div>`;
+  modal(html, { dismissable: false });
+  $('#mBack').onclick = closeModal;
   const decisions = {};
   document.querySelectorAll('[data-dec]').forEach(b => b.onclick = () => {
     const [i, act] = b.dataset.dec.split(':');
@@ -836,11 +839,11 @@ function renderProgress() {
     const nEx = Object.keys(s.entries).length;
     const nSets = Object.values(s.entries).reduce((n, e) => n + e.sets.length, 0);
     const open = expandedSession === s.id;
-    html += `<div class="card hist-item" data-sess="${esc(s.id)}">
-      <div class="hist-head">
-        <div><b>${esc(dayName(s.day))}</b> <span class="faint">· ${fmtDate(s.date)}</span></div>
-        <div class="faint">${nEx} lifts · ${nSets} sets · ${s.minutes || '?'} min</div>
-      </div>
+    html += `<div class="card hist-item">
+      <button class="hist-head hist-toggle" data-sess="${esc(s.id)}" aria-expanded="${open}">
+        <span><b>${esc(dayName(s.day))}</b> <span class="faint">· ${fmtDate(s.date)}</span></span>
+        <span class="faint">${nEx} lifts · ${nSets} sets · ${s.minutes || '?'} min</span>
+      </button>
       ${open ? histDetail(s) : ''}
     </div>`;
   });
@@ -1162,13 +1165,13 @@ function renderCoach() {
   <div class="section-title">Settings</div>
   <div class="card">
     <div class="settings-row"><div><div class="s-label">Bar weight</div></div>
-      <input id="setBar" type="number" value="${S.settings.barWeight}"></div>
+      <input id="setBar" type="number" inputmode="decimal" aria-label="Bar weight" value="${S.settings.barWeight}"></div>
     <div class="settings-row"><div><div class="s-label">Plate pairs</div><div class="s-sub">comma-separated, one entry per pair you own</div></div>
-      <input id="setPlates" type="text" value="${S.settings.platePairs.join(', ')}"></div>
+      <input id="setPlates" type="text" aria-label="Plate pairs" value="${S.settings.platePairs.join(', ')}"></div>
     <div class="settings-row"><div><div class="s-label">Rest — isolation</div><div class="s-sub">seconds</div></div>
-      <input id="setRest" type="number" value="${S.settings.restDefault}"></div>
+      <input id="setRest" type="number" inputmode="numeric" aria-label="Rest for isolation, seconds" value="${S.settings.restDefault}"></div>
     <div class="settings-row"><div><div class="s-label">Rest — barbell compounds</div><div class="s-sub">seconds</div></div>
-      <input id="setRestC" type="number" value="${S.settings.restCompound}"></div>
+      <input id="setRestC" type="number" inputmode="numeric" aria-label="Rest for barbell compounds, seconds" value="${S.settings.restCompound}"></div>
   </div>
   <div class="btn-row" style="margin-bottom:20px"><button class="btn secondary" id="saveSettings">Save settings</button></div>
   <button class="btn danger" id="resetAll">Reset all data</button>`;
@@ -1227,11 +1230,34 @@ function renderCoach() {
 }
 
 // ============================================================ modal helpers
-function modal(inner) {
-  $('#modalRoot').innerHTML = `<div class="modal-backdrop"><div class="modal">${inner}</div></div>`;
-  $('#modalRoot .modal-backdrop').addEventListener('click', ev => { if (ev.target.classList.contains('modal-backdrop')) closeModal(); });
+// opts.dismissable=false: backdrop taps and Escape are ignored (finish-flow sheets, where a
+// stray tap would otherwise silently cancel saving the workout).
+let modalOpts = null;
+let modalReturnFocus = null;
+function modal(inner, opts = {}) {
+  modalOpts = { dismissable: true, ...opts };
+  if (!$('#modalRoot').innerHTML) modalReturnFocus = document.activeElement;
+  $('#modalRoot').innerHTML = `<div class="modal-backdrop"><div class="modal" role="dialog" aria-modal="true" tabindex="-1">${inner}</div></div>`;
+  const m = $('#modalRoot .modal');
+  const h = m.querySelector('h3');
+  if (h) { h.id = 'mTitle'; m.setAttribute('aria-labelledby', 'mTitle'); }
+  $('#modalRoot .modal-backdrop').addEventListener('click', ev => {
+    if (ev.target.classList.contains('modal-backdrop') && modalOpts.dismissable) closeModal();
+  });
+  document.body.style.overflow = 'hidden';
+  const first = m.querySelector('button, input, textarea');
+  try { (first || m).focus({ preventScroll: true }); } catch (e) {}
 }
-function closeModal() { $('#modalRoot').innerHTML = ''; }
+function closeModal() {
+  $('#modalRoot').innerHTML = '';
+  document.body.style.overflow = '';
+  modalOpts = null;
+  if (modalReturnFocus && document.contains(modalReturnFocus)) { try { modalReturnFocus.focus({ preventScroll: true }); } catch (e) {} }
+  modalReturnFocus = null;
+}
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape' && modalOpts && modalOpts.dismissable) closeModal();
+});
 function confirmModal(title, body, onYes, okOnly) {
   modal(`<h3>${esc(title)}</h3><div class="muted">${esc(body)}</div>
     <div class="btn-row" style="margin-top:14px">

@@ -5,9 +5,10 @@
   --card: #1a2029;
   --card-2: #212936;
   --line: #2a3342;
+  --line-strong: #3d4859; /* >= 3:1 non-text contrast for pending set slots */
   --text: #e8ecf2;
   --text-dim: #97a3b4;
-  --text-faint: #5f6b7d;
+  --text-faint: #8390a3;  /* >= 4.5:1 on --card / --card-2 */
   --accent: #f2a33c;      /* amber — plates & progress */
   --accent-soft: rgba(242,163,60,.14);
   --green: #4cc38a;
@@ -18,6 +19,7 @@
   --red-soft: rgba(229,100,95,.14);
   --radius: 14px;
   --tabbar-h: 64px;
+  color-scheme: dark;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -57,7 +59,7 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 }
 .tab {
   flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
-  background: none; border: none; color: var(--text-faint); font-size: .68rem; font-weight: 700;
+  background: none; border: none; color: var(--text-faint); font-size: .72rem; font-weight: 700; position: relative;
   cursor: pointer; font-family: inherit;
 }
 .tab svg { width: 23px; height: 23px; fill: currentColor; }
@@ -85,7 +87,7 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 .btn.danger { background: var(--red-soft); color: var(--red); }
 .btn-ghost {
   background: none; border: 1px solid var(--line); border-radius: 10px; color: var(--text-dim);
-  font: inherit; font-weight: 700; font-size: .82rem; padding: 8px 12px; cursor: pointer;
+  font: inherit; font-weight: 700; font-size: .82rem; padding: 10px 14px; min-height: 44px; cursor: pointer;
 }
 .btn-row { display: flex; gap: 10px; }
 .btn-row .btn { flex: 1; }
@@ -137,8 +139,8 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 
 .set-dots { display: flex; gap: 8px; padding: 10px 15px 13px; flex-wrap: wrap; }
 .set-dot {
-  min-width: 52px; height: 44px; border-radius: 11px; border: 1.5px dashed var(--line);
-  background: none; color: var(--text-faint); font: inherit; font-weight: 800; font-size: .9rem;
+  min-width: 52px; height: 44px; border-radius: 11px; border: 1.5px dashed var(--line-strong);
+  background: none; color: var(--text-dim); font: inherit; font-weight: 800; font-size: .9rem;
   cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center;
   padding: 0 8px;
 }
@@ -151,17 +153,17 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 
 /* set logger (inline expand) */
 .logger { border-top: 1px solid var(--line); background: var(--bg-2); padding: 14px 15px; }
-.logger-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
-.stepper { display: flex; align-items: center; gap: 2px; background: var(--card-2); border-radius: 12px; border: 1px solid var(--line); }
+.logger-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.stepper { display: flex; align-items: center; justify-content: space-between; gap: 2px; flex: 1; min-width: 0; background: var(--card-2); border-radius: 12px; border: 1px solid var(--line); }
 .stepper button {
-  width: 46px; height: 48px; border: none; background: none; color: var(--accent);
+  width: 44px; flex: 0 0 44px; height: 48px; border: none; background: none; color: var(--accent);
   font-size: 1.4rem; font-weight: 800; cursor: pointer; font-family: inherit;
 }
-.stepper .stepper-val { min-width: 64px; text-align: center; font-weight: 800; font-size: 1.15rem; }
+.stepper .stepper-val { min-width: 0; flex: 1; text-align: center; font-weight: 800; font-size: 1.15rem; }
 .stepper .stepper-val small { display: block; font-size: .62rem; color: var(--text-faint); font-weight: 700; letter-spacing: .05em; }
 .effort-row { display: flex; gap: 8px; margin-bottom: 12px; }
 .effort-btn {
-  flex: 1; padding: 11px 0; border-radius: 11px; border: 1px solid var(--line); background: var(--card-2);
+  flex: 1; padding: 11px 0; min-height: 46px; border-radius: 11px; border: 1px solid var(--line); background: var(--card-2);
   color: var(--text-dim); font: inherit; font-weight: 800; font-size: .85rem; cursor: pointer;
 }
 .effort-btn.sel-easy  { background: var(--green-soft); border-color: var(--green); color: var(--green); }
@@ -169,7 +171,7 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 .effort-btn.sel-grind { background: var(--red-soft);   border-color: var(--red);   color: var(--red); }
 .logger textarea, .modal textarea, .modal input[type=text], .modal input[type=number], .cardio-form input, .cardio-form textarea {
   width: 100%; background: var(--card-2); border: 1px solid var(--line); border-radius: 10px;
-  color: var(--text); font: inherit; font-size: .9rem; padding: 10px 12px; resize: none;
+  color: var(--text); font: inherit; font-size: 16px; padding: 10px 12px; min-height: 44px; resize: none; /* 16px stops iOS focus-zoom */
 }
 .logger textarea { margin-bottom: 12px; }
 
@@ -217,7 +219,7 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 .ex-picker { display: flex; gap: 8px; overflow-x: auto; padding: 4px 2px 10px; scrollbar-width: none; }
 .ex-picker::-webkit-scrollbar { display: none; }
 .chip {
-  flex: 0 0 auto; padding: 8px 14px; border-radius: 999px; border: 1px solid var(--line);
+  flex: 0 0 auto; padding: 10px 16px; min-height: 40px; border-radius: 999px; border: 1px solid var(--line);
   background: var(--card); color: var(--text-dim); font: inherit; font-size: .8rem; font-weight: 700; cursor: pointer;
   white-space: nowrap;
 }
@@ -253,7 +255,7 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 .settings-row:last-child { border-bottom: none; }
 .settings-row .s-label { font-size: .88rem; font-weight: 600; }
 .settings-row .s-sub { color: var(--text-faint); font-size: .74rem; margin-top: 2px; }
-.settings-row input { width: 130px; text-align: right; background: var(--card-2); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font: inherit; font-size: .85rem; padding: 7px 10px; }
+.settings-row input { width: 130px; text-align: right; background: var(--card-2); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font: inherit; font-size: 16px; padding: 7px 10px; min-height: 44px; }
 
 .toast {
   position: fixed; left: 50%; transform: translateX(-50%);
@@ -283,3 +285,29 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 body.resting { padding-bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom) + 84px); }
 body.resting .toast { bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom) + 90px); }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* ---------- a11y / polish ---------- */
+.rest-actions .btn-ghost { min-width: 56px; }
+.cardio-form input, .settings-row input { min-height: 44px; }
+input[type=number] { -moz-appearance: textfield; appearance: textfield; }
+input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+/* day cards / history rows are real buttons now — reset UA button styles */
+button.day-card, button.hist-toggle {
+  width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer;
+}
+button.hist-toggle { background: none; border: none; padding: 0; display: flex; gap: 8px; }
+.hist-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.cardio-item .hist-actions { margin-top: 6px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* amber dot on the Workout tab while a session is open */
+.tab.live::after {
+  content: ''; position: absolute; top: 10px; right: calc(50% - 16px);
+  width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
+/* pinch-zoom stays available, but rapid double-taps on steppers must not zoom the page */
+html, button, a, [role=button] { touch-action: manipulation; }
+.day-card .day-title { display: block; font-size: 1.05rem; font-weight: 800; }
+.day-card .day-meta { display: block; }
