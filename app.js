@@ -13,24 +13,122 @@ function freshState() {
     cardio: [],     // cardio/sport entries
     events: [],     // progression events (for coach report)
     active: null,   // in-flight workout
+    schemaVersion: SCHEMA_VERSION,
   };
 }
 
+// Bump when normalize() learns a new migration. Every migration is additive: fields are only
+// ever defaulted, coerced or repaired — never renamed or dropped.
+const SCHEMA_VERSION = 2;
+const EFFORTS = ['easy', 'solid', 'grind'];
+const BODY_CHECKS = ['good', 'tight', 'pain'];
+
+// Forward-migrate + sanitize a stored or imported state object. Used by load() and Import JSON.
+// Throws only when the input is not a Lift Studio state at all.
+function normalize(st) {
+  if (!st || typeof st !== 'object' || Array.isArray(st)) throw new Error('not a Lift Studio state');
+  const arr = v => (Array.isArray(v) ? v : []);
+  const num = (v, d = 0) => { const n = Number(v); return v !== null && v !== '' && isFinite(n) ? n : d; };
+  const numOrNull = v => num(v, null);
+  const str = v => (v == null ? '' : String(v));
+
+  // settings: seed defaults + stored values
+  const set = { ...SEED_PROGRAM.settings, ...(st.settings && typeof st.settings === 'object' ? st.settings : {}) };
+  Object.keys(SEED_PROGRAM.settings).forEach(k => {
+    if (k !== 'platePairs') set[k] = num(set[k], SEED_PROGRAM.settings[k]);
+  });
+  set.platePairs = arr(set.platePairs).map(Number).filter(x => isFinite(x) && x > 0);
+  if (!set.platePairs.length) set.platePairs = [...SEED_PROGRAM.settings.platePairs];
+  st.settings = set;
+
+  // exercises: keep stored ones (coerced), merge any new seed exercises
+  st.exercises = arr(st.exercises).filter(e => e && typeof e === 'object' && e.id != null).map(e => ({
+    ...e,
+    id: str(e.id), name: str(e.name || e.id), type: str(e.type), loadLabel: str(e.loadLabel),
+    day: e.day == null ? null : str(e.day),
+    sets: Math.max(1, num(e.sets, 3)), repLow: num(e.repLow, 8), repHigh: num(e.repHigh, 10),
+    weight: numOrNull(e.weight), increment: num(e.increment, 0),
+  }));
+  const have = new Set(st.exercises.map(e => e.id));
+  SEED_PROGRAM.exercises.forEach(e => { if (!have.has(e.id)) st.exercises.push({ ...e }); });
+
+  st.days = arr(st.days).filter(d => d && d.id != null).map(d => ({ ...d, id: str(d.id), name: str(d.name || d.id) }));
+  if (!st.days.length) st.days = SEED_PROGRAM.days.map(d => ({ ...d }));
+
+  // sessions / active workout. Repairs sets arrays holding null (out-of-order set taps
+  // in older versions left holes that JSON saved as null).
+  const normEntries = entries => {
+    const out = {};
+    if (!entries || typeof entries !== 'object') return out;
+    Object.keys(entries).forEach(k => {
+      const e = entries[k];
+      if (!e || typeof e !== 'object') return;
+      out[k] = {
+        ...e,
+        target: numOrNull(e.target),
+        sets: arr(e.sets).filter(x => x && typeof x === 'object').map(x => ({
+          ...x,
+          reps: num(x.reps), weight: num(x.weight),
+          effort: EFFORTS.includes(x.effort) ? x.effort : 'solid',
+          note: typeof x.note === 'string' ? x.note : '',
+        })),
+      };
+    });
+    return out;
+  };
+  const normSession = s => {
+    // (uid() isn't defined yet when load() runs at startup — inline it)
+    const o = { ...s, id: str(s.id || 's' + Math.random().toString(36).slice(2, 9) + Date.now().toString(36)), day: str(s.day), date: str(s.date), entries: normEntries(s.entries) };
+    if (o.bodyCheck != null && !BODY_CHECKS.includes(o.bodyCheck)) o.bodyCheck = null;
+    if (o.bodyNote != null) o.bodyNote = str(o.bodyNote);
+    if (o.minutes != null) o.minutes = num(o.minutes, null);
+    return o;
+  };
+  st.sessions = arr(st.sessions).filter(s => s && typeof s === 'object').map(normSession);
+  st.active = st.active && typeof st.active === 'object' ? normSession(st.active) : null;
+  if (st.active) st.active.startedAt = num(st.active.startedAt, Date.now());
+
+  st.cardio = arr(st.cardio).filter(c => c && typeof c === 'object').map(c => ({
+    ...c,
+    date: str(c.date), kind: str(c.kind || 'Other'), minutes: num(c.minutes),
+    distance: str(c.distance), note: str(c.note),
+    hr: numOrNull(c.hr), cal: numOrNull(c.cal),
+  }));
+  st.events = arr(st.events).filter(e => e && typeof e === 'object');
+  st.schemaVersion = SCHEMA_VERSION;
+  return st;
+}
+
+// loadProblem: saved data exists but could not be read. The raw text is kept aside and
+// save() refuses to write, so a parse bug can never silently overwrite TJ's real log.
+let loadProblem = null;
+let saveFailed = false;
 let S = load();
 function load() {
+  let raw = null;
+  try { raw = localStorage.getItem(LS_KEY); } catch (e) { saveFailed = true; return freshState(); }
+  if (!raw) return freshState();
   try {
-    const raw = localStorage.getItem(LS_KEY);
-    if (!raw) return freshState();
-    const st = JSON.parse(raw);
-    // merge any new seed exercises/settings keys (forward compat)
-    const have = new Set(st.exercises.map(e => e.id));
-    SEED_PROGRAM.exercises.forEach(e => { if (!have.has(e.id)) st.exercises.push({ ...e }); });
-    st.settings = { ...SEED_PROGRAM.settings, ...st.settings };
-    st.events = st.events || [];
-    return st;
-  } catch (e) { return freshState(); }
+    return normalize(JSON.parse(raw));
+  } catch (e) {
+    try { localStorage.setItem(LS_KEY + '.corrupt-' + Date.now(), raw); } catch (e2) {}
+    loadProblem = { raw, error: String((e && e.message) || e) };
+    console.error('Lift Studio: saved data unreadable', e);
+    return freshState();
+  }
 }
-function save() { try { localStorage.setItem(LS_KEY, JSON.stringify(S)); } catch (e) {} }
+function save() {
+  if (loadProblem) return; // never overwrite data we couldn't read
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(S));
+    if (saveFailed) { saveFailed = false; render(); }
+  } catch (e) {
+    console.error('Lift Studio: save failed', e && e.name, e);
+    if (!saveFailed) { saveFailed = true; render(); toast("Couldn't save — export a backup now."); }
+  }
+}
+// Ask the browser not to evict our storage (best-effort; Safari may ignore it).
+try { navigator.storage && navigator.storage.persist && navigator.storage.persist().catch(() => {}); } catch (e) {}
 
 // ============================================================ ui state (transient)
 let tab = 'workout';
@@ -61,6 +159,23 @@ function toast(msg) {
   t.className = 'toast'; t.textContent = msg;
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 2200);
+}
+
+// ---- backup age -------------------------------------------------
+function backupDays() {
+  return S.lastExportAt ? Math.floor((Date.now() - S.lastExportAt) / 86400000) : null;
+}
+function backupAgeText() {
+  const d = backupDays();
+  return d == null ? 'No backup exported from this device yet.'
+    : d === 0 ? 'Last backup: today.' : `Last backup: ${d} day${d > 1 ? 's' : ''} ago.`;
+}
+function backupOverdue() {
+  const d = backupDays();
+  return S.sessions.length > 0 && (d == null || d > 14);
+}
+function hasPreImportBackup() {
+  try { return !!localStorage.getItem(LS_KEY + '.backup-pre-import'); } catch (e) { return false; }
 }
 
 // ---- plate math -------------------------------------------------
@@ -227,13 +342,14 @@ function renderWorkout() {
   const sug = suggestedDay();
   let html = `<div class="hero">
     <h2>Ready to lift?</h2>
-    <div class="muted">Weekly split — <b style="color:var(--accent)">${dayName(sug)}</b> is up next in the rotation.</div>
+    <div class="muted">Weekly split — <b style="color:var(--accent)">${esc(dayName(sug))}</b> is up next in the rotation.</div>
+    ${backupOverdue() ? `<div class="faint" style="margin-top:8px">${backupAgeText()} <a href="#" id="goBackup" class="link">Back up on the Coach tab</a></div>` : ''}
   </div>
   <div class="section-title">Pick your day</div>`;
   for (const d of S.days) {
     const last = lastDone(d.id);
     const exs = S.exercises.filter(e => e.day === d.id);
-    html += `<div class="card day-card ${d.id === sug ? 'suggested' : ''}" data-start="${d.id}">
+    html += `<div class="card day-card ${d.id === sug ? 'suggested' : ''}" data-start="${esc(d.id)}">
       <div>
         <h3>${esc(d.name)} ${d.id === sug ? '<span class="pill amber">UP NEXT</span>' : ''}</h3>
         <div class="day-meta">${exs.length} exercises · ${last ? 'last: ' + fmtDate(last) + ` (${daysAgo(last)}d ago)` : 'not logged yet'}</div>
@@ -243,6 +359,8 @@ function renderWorkout() {
   }
   view.innerHTML = html;
   view.querySelectorAll('[data-start]').forEach(el => el.onclick = () => startWorkout(el.dataset.start));
+  const gb = $('#goBackup');
+  if (gb) gb.onclick = ev => { ev.preventDefault(); tab = 'coach'; render(); };
 }
 
 function startWorkout(dayId) {
@@ -263,7 +381,7 @@ function renderActive() {
     <span class="pill gray">${mins} min</span>
   </div>`;
   for (const ex of exs) {
-    const entry = a.entries[ex.id];
+    const entry = a.entries[ex.id] || (a.entries[ex.id] = { target: ex.weight, sets: [] });
     const target = entry.target;
     const done = entry.sets;
     const isTimed = ex.type === 'timed';
@@ -569,7 +687,7 @@ function renderProgress() {
   if (!progressEx || !logged.find(e => e.id === progressEx)) progressEx = (logged[0] || {}).id;
 
   let html = `<div class="ex-picker">` + logged.map(e =>
-    `<button class="chip ${e.id === progressEx ? 'active' : ''}" data-pex="${e.id}">${esc(e.name)}</button>`).join('') + `</div>`;
+    `<button class="chip ${e.id === progressEx ? 'active' : ''}" data-pex="${esc(e.id)}">${esc(e.name)}</button>`).join('') + `</div>`;
 
   const ex = exById(progressEx);
   if (ex) {
@@ -597,7 +715,7 @@ function renderProgress() {
     const nEx = Object.keys(s.entries).length;
     const nSets = Object.values(s.entries).reduce((n, e) => n + e.sets.length, 0);
     const open = expandedSession === s.id;
-    html += `<div class="card hist-item" data-sess="${s.id}">
+    html += `<div class="card hist-item" data-sess="${esc(s.id)}">
       <div class="hist-head">
         <div><b>${esc(dayName(s.day))}</b> <span class="faint">· ${fmtDate(s.date)}</span></div>
         <div class="faint">${nEx} lifts · ${nSets} sets · ${s.minutes || '?'} min</div>
@@ -758,7 +876,7 @@ function renderCardio() {
   let html = `<div class="hero"><h2>Cardio &amp; sports</h2><div class="muted">${esc(nudge)}</div></div>
   <div class="card cardio-form">
     <div class="kind-row">${SEED_PROGRAM.cardioKinds.map(k =>
-      `<button class="chip ${cardioKind === k ? 'active' : ''}" data-kind="${k}">${k}</button>`).join('')}</div>
+      `<button class="chip ${cardioKind === k ? 'active' : ''}" data-kind="${esc(k)}">${k}</button>`).join('')}</div>
     <div class="form-row">
       <div><label>Minutes</label><input type="number" id="cMin" inputmode="numeric" placeholder="30"></div>
       <div><label>Distance (optional)</label><input type="text" id="cDist" placeholder="e.g. 2 mi / 2000 m"></div>
@@ -903,7 +1021,7 @@ function coachReport() {
 function renderCoach() {
   const report = coachReport();
   let html = `<div class="hero"><h2>Coach hand-off</h2>
-    <div class="muted">Copy the report below and paste it to Claude for a coaching review. Vault auto-sync arrives with the GitHub backend.</div></div>
+    <div class="muted">Copy the report below and paste it to Claude for a coaching review. Data lives only on this device — use Export JSON below to back it up.</div></div>
   <div class="btn-row" style="margin-bottom:12px">
     <button class="btn" id="copyReport">Copy coach report</button>
   </div>
@@ -911,10 +1029,12 @@ function renderCoach() {
 
   <div class="section-title">Backup</div>
   <div class="card">
+    <div class="faint" style="margin-bottom:10px">${backupAgeText()}</div>
     <div class="btn-row">
       <button class="btn secondary" id="exportJson">Export JSON</button>
       <button class="btn secondary" id="importJson">Import JSON</button>
     </div>
+    ${hasPreImportBackup() ? `<button class="btn-ghost" id="undoImport" style="margin-top:10px;width:100%">Undo last import</button>` : ''}
     <input type="file" id="importFile" accept=".json,application/json" class="hidden">
   </div>
 
@@ -938,37 +1058,41 @@ function renderCoach() {
     catch (e) { toast('Copy failed — select the text manually.'); }
   };
   $('#exportJson').onclick = async () => {
-    const name = `lift-studio-${todayISO()}.json`;
-    const blob = new Blob([JSON.stringify(S, null, 2)], { type: 'application/json' });
-    // Home-screen (standalone) iOS apps handle <a download> poorly — use the share sheet
-    // ("Save to Files", AirDrop, Mail…) when available.
-    const standalone = window.navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
-    try {
-      const file = new File([blob], name, { type: 'application/json' });
-      if (standalone && navigator.canShare && navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: 'Lift Studio backup' });
-        return;
-      }
-    } catch (e) { if (e && e.name === 'AbortError') return; }
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = name;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 4000); // Safari needs the URL alive after click
+    const ok = await downloadFile(`lift-studio-${todayISO()}.json`, JSON.stringify(S, null, 2));
+    if (ok) { S.lastExportAt = Date.now(); save(); render(); }
   };
   $('#importJson').onclick = () => $('#importFile').click();
   $('#importFile').onchange = ev => {
     const f = ev.target.files[0]; if (!f) return;
+    ev.target.value = ''; // allow picking the same file again
     const r = new FileReader();
     r.onload = () => {
+      let data;
       try {
-        const data = JSON.parse(r.result);
-        if (!data.exercises || !data.sessions) throw new Error('bad file');
-        S = data; coachReportCache = null; save(); render(); toast('Imported.');
-      } catch (e) { toast('That file did not look like a Lift Studio backup.'); }
+        data = JSON.parse(r.result);
+        if (!data || !Array.isArray(data.exercises) || !Array.isArray(data.sessions)) throw new Error('bad file');
+        data = normalize(data);
+      } catch (e) { return toast('That file did not look like a Lift Studio backup.'); }
+      const here = loadProblem ? 'unreadable data' : `${S.sessions.length} workouts and ${S.cardio.length} cardio entries${S.active ? ' plus the workout in progress' : ''}`;
+      confirmModal('Replace all data?',
+        `This device has ${here}. The file has ${data.sessions.length} workouts and ${data.cardio.length} cardio entries. Everything here is replaced; you can undo once from this screen.`,
+        () => {
+          if (!loadProblem) { try { localStorage.setItem(LS_KEY + '.backup-pre-import', JSON.stringify(S)); } catch (e) {} }
+          endRest(false);
+          S = data; loadProblem = null; openLogger = null; coachReportCache = null;
+          save(); render(); toast('Imported.');
+        });
     };
     r.readAsText(f);
   };
+  const undo = $('#undoImport');
+  if (undo) undo.onclick = () => confirmModal('Undo last import?', 'Restores the data this device had right before the last import. Anything logged since the import is lost.', () => {
+    try {
+      S = normalize(JSON.parse(localStorage.getItem(LS_KEY + '.backup-pre-import')));
+      localStorage.removeItem(LS_KEY + '.backup-pre-import');
+    } catch (e) { return toast('No usable backup found.'); }
+    endRest(false); openLogger = null; coachReportCache = null; save(); render(); toast('Import undone.');
+  });
   $('#saveSettings').onclick = () => {
     S.settings.barWeight = parseFloat($('#setBar').value) || 45;
     const plates = $('#setPlates').value.split(',').map(x => parseFloat(x.trim())).filter(x => x > 0);
@@ -978,7 +1102,7 @@ function renderCoach() {
     save(); toast('Settings saved.');
   };
   $('#resetAll').onclick = () => confirmModal('Reset everything?', 'All workouts, cardio, and settings are wiped. Export a JSON backup first if unsure.',
-    () => { S = freshState(); coachReportCache = null; save(); render(); toast('Fresh start.'); });
+    () => { endRest(false); S = freshState(); loadProblem = null; openLogger = null; coachReportCache = null; save(); render(); toast('Fresh start.'); });
 }
 
 // ============================================================ modal helpers
@@ -1001,11 +1125,62 @@ function confirmModal(title, body, onYes, okOnly) {
 // ============================================================ shell
 function render() {
   $('#topbarDate').textContent = new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
-  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.tab').forEach(b => {
+    const on = b.dataset.tab === tab;
+    b.classList.toggle('active', on);
+    if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+    b.classList.toggle('live', b.dataset.tab === 'workout' && !!S.active);
+  });
   if (tab === 'workout') renderWorkout();
   else if (tab === 'progress') renderProgress();
   else if (tab === 'cardio') renderCardio();
   else renderCoach();
+  renderBanner();
+}
+
+// Data-safety banners pinned to the top of every tab.
+function renderBanner() {
+  let html = '';
+  if (loadProblem) {
+    html = `<div class="banner danger" role="alert"><b>Your saved data couldn't be read.</b>
+      Nothing has been overwritten, and saving is paused so it stays that way. Export the raw data and send it to Claude to repair, or import a backup.
+      <div class="btn-row" style="margin-top:10px">
+        <button class="btn secondary" id="bnExportRaw">Export raw</button>
+        <button class="btn danger" id="bnFresh">Start fresh</button>
+      </div></div>`;
+  } else if (saveFailed) {
+    html = `<div class="banner danger" role="alert"><b>Couldn't save to this device.</b>
+      Storage is full or blocked (private browsing?). New sets only live in memory — export a backup from the Coach tab now.</div>`;
+  }
+  if (!html) return;
+  view.insertAdjacentHTML('afterbegin', html);
+  const ex = $('#bnExportRaw');
+  if (ex) ex.onclick = () => downloadFile(`lift-studio-raw-${todayISO()}.json`, loadProblem.raw);
+  const fr = $('#bnFresh');
+  if (fr) fr.onclick = () => confirmModal('Start fresh?',
+    'The unreadable data stays stored under a separate backup key on this device, but the app will start empty. Export raw first if unsure.',
+    () => { loadProblem = null; S = freshState(); coachReportCache = null; save(); render(); });
+}
+
+// Save a text file: share sheet in the iOS home-screen app, <a download> elsewhere.
+async function downloadFile(name, text) {
+  const blob = new Blob([text], { type: 'application/json' });
+  // Home-screen (standalone) iOS apps handle <a download> poorly — use the share sheet
+  // ("Save to Files", AirDrop, Mail…) when available.
+  const standalone = window.navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
+  try {
+    const file = new File([blob], name, { type: 'application/json' });
+    if (standalone && navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: 'Lift Studio backup' });
+      return true;
+    }
+  } catch (e) { if (e && e.name === 'AbortError') return false; }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000); // Safari needs the URL alive after click
+  return true;
 }
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => { tab = b.dataset.tab; openLogger = null; render(); });
 render();

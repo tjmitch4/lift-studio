@@ -269,3 +269,9 @@ input, textarea { user-select: text; -webkit-user-select: text; }
   .modal-backdrop { align-items: center; }
   .modal { border-radius: 20px; }
 }
+
+/* ---------- data-safety banner ---------- */
+.banner { border-radius: var(--radius); padding: 12px 14px; margin: 4px 0 12px; font-size: .85rem; line-height: 1.4; color: var(--text); }
+.banner.danger { background: var(--red-soft); border: 1px solid var(--red); }
+.banner b { display: block; margin-bottom: 2px; }
+.link { color: var(--accent); font-weight: 700; }
