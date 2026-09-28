@@ -161,6 +161,15 @@ function toast(msg) {
   setTimeout(() => t.remove(), 2200);
 }
 
+const scrollBehavior = () => (window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth');
+// keyboard support for non-button tap targets marked role="button"
+document.addEventListener('keydown', ev => {
+  const el = ev.target;
+  if ((ev.key === 'Enter' || ev.key === ' ') && el && el.getAttribute && el.getAttribute('role') === 'button') {
+    ev.preventDefault(); el.click();
+  }
+});
+
 // ---- backup age -------------------------------------------------
 function backupDays() {
   return S.lastExportAt ? Math.floor((Date.now() - S.lastExportAt) / 86400000) : null;
@@ -375,11 +384,13 @@ function startWorkout(dayId) {
 function renderActive() {
   const a = S.active;
   const exs = S.exercises.filter(e => e.day === a.day || a.entries[e.id]);
-  const mins = Math.floor((Date.now() - a.startedAt) / 60000);
   let html = `<div class="workout-head">
     <h2>${esc(dayName(a.day))}</h2>
-    <span class="pill gray">${mins} min</span>
+    <span class="pill gray" id="woMins">${activeMinutes()} min</span>
   </div>`;
+  if (a.date !== todayISO()) {
+    html += `<div class="banner warn">This workout was started ${esc(fmtDate(a.date))}. Finish it to save what you logged, or discard it to start today's.</div>`;
+  }
   for (const ex of exs) {
     const entry = a.entries[ex.id] || (a.entries[ex.id] = { target: ex.weight, sets: [] });
     const target = entry.target;
@@ -390,21 +401,31 @@ function renderActive() {
       : isBody ? `${ex.sets}× max reps`
       : `${target == null ? 'set weight' : fmtW(target) + ' lb'} · ${ex.sets}×${ex.repLow}–${ex.repHigh}`;
     const plates = target != null ? plateText(ex, target) : '';
+    const exAttr = esc(ex.id);
 
+    // Only logged sets and the single next slot are tappable, so a mis-tap on a later
+    // slot can't leave a gap in the sets array.
     let dots = '';
     for (let i = 0; i < Math.max(ex.sets, done.length); i++) {
       const st = done[i];
       if (st) {
-        dots += `<button class="set-dot done e-${st.effort}" data-log="${ex.id}:${i}">
-          ${isTimed ? st.reps + 's' : st.reps}<small>${isTimed || isBody ? '' : fmtW(st.weight)}</small></button>`;
+        const effLetter = st.effort[0].toUpperCase();
+        const label = `Set ${i + 1}: ${isTimed ? st.reps + ' seconds' : st.reps + ' reps'}${isTimed || isBody ? '' : ' at ' + fmtW(st.weight) + ' lb'}, ${st.effort}. Tap to edit.`;
+        dots += `<button class="set-dot done e-${st.effort}" data-ex="${exAttr}" data-idx="${i}" aria-label="${esc(label)}">
+          ${isTimed ? st.reps + 's' : st.reps}<small>${isTimed || isBody ? '' : fmtW(st.weight) + ' · '}${effLetter}</small></button>`;
+      } else if (i === done.length) {
+        dots += `<button class="set-dot next" data-ex="${exAttr}" data-idx="${i}" aria-label="Log set ${i + 1}">LOG</button>`;
       } else {
-        const isNext = i === done.length;
-        dots += `<button class="set-dot ${isNext ? 'next' : ''}" data-log="${ex.id}:${i}">${isNext ? 'LOG' : i + 1}</button>`;
+        dots += `<span class="set-dot" aria-hidden="true">${i + 1}</span>`;
       }
     }
+    if (done.length >= ex.sets) {
+      dots += `<button class="set-dot extra" data-ex="${exAttr}" data-idx="${done.length}" aria-label="Add an extra set">+</button>`;
+    }
+    const headTap = done.length < ex.sets;
 
     html += `<div class="card ex-card">
-      <div class="ex-head" data-log="${ex.id}:${done.length < ex.sets ? done.length : done.length}">
+      <div class="ex-head" ${headTap ? `data-ex="${exAttr}" data-idx="${done.length}" role="button" tabindex="0" aria-label="Log next set of ${esc(ex.name)}"` : ''}>
         <div class="ex-title-row">
           <div class="ex-name">${esc(ex.name)}</div>
           <div class="ex-target">${targetTxt}</div>
@@ -429,10 +450,9 @@ function renderActive() {
   view.innerHTML = html;
   $('#addBonus').onclick = bonusModal;
 
-  view.querySelectorAll('[data-log]').forEach(el => el.onclick = ev => {
+  view.querySelectorAll('[data-ex][data-idx]').forEach(el => el.onclick = ev => {
     ev.stopPropagation();
-    const [exId, idx] = el.dataset.log.split(':');
-    openSetLogger(exId, +idx);
+    openSetLogger(el.dataset.ex, +el.dataset.idx);
   });
   wireLogger();
   $('#finishWo') && ($('#finishWo').onclick = finishFlow);
@@ -441,15 +461,21 @@ function renderActive() {
     () => { S.active = null; openLogger = null; endRest(false); save(); render(); }));
 }
 
+function activeMinutes() {
+  return S.active ? Math.max(0, Math.floor((Date.now() - S.active.startedAt) / 60000)) : 0;
+}
+
 function openSetLogger(exId, setIdx) {
   const ex = exById(exId);
   const entry = S.active.entries[exId];
+  if (!ex || !entry) return;
+  setIdx = Math.max(0, Math.min(setIdx, entry.sets.length)); // never leave a gap
   if (openLogger && openLogger.exId === exId && openLogger.setIdx === setIdx) { openLogger = null; render(); return; }
   const existing = entry.sets[setIdx];
   const prevSet = entry.sets[setIdx - 1] || entry.sets[entry.sets.length - 1];
   const isTimed = ex.type === 'timed';
   const defaultW = ex.type === 'barbell' ? 95 : ex.type === 'dumbbell' ? 15 : 30;
-  openLogger = existing ? { exId, setIdx, ...existing, showNote: !!existing.note }
+  openLogger = existing ? { exId, setIdx, ...existing, showNote: !!existing.note, editing: true }
     : {
       exId, setIdx,
       reps: isTimed ? ex.repHigh : (prevSet ? prevSet.reps : (ex.repHigh > 30 ? 10 : ex.repHigh)),
@@ -458,72 +484,98 @@ function openSetLogger(exId, setIdx) {
     };
   render();
   const card = view.querySelector(`.logger`);
-  if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  if (card) card.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
 }
 
 function loggerHTML(ex) {
   const L = openLogger;
   const isTimed = ex.type === 'timed';
   const noWeight = isTimed || ex.type === 'bodyweight';
+  const unit = isTimed ? 'seconds' : 'reps';
   return `<div class="logger">
     <div class="logger-row">
       <div class="stepper">
-        <button data-step="reps:-1">−</button>
-        <div class="stepper-val">${L.reps}<small>${isTimed ? 'SEC' : 'REPS'}</small></div>
-        <button data-step="reps:1">+</button>
+        <button data-step="reps:-1" aria-label="Decrease ${unit}">−</button>
+        <div class="stepper-val" aria-live="polite">${L.reps}<small>${isTimed ? 'SEC' : 'REPS'}</small></div>
+        <button data-step="reps:1" aria-label="Increase ${unit}">+</button>
       </div>
       ${noWeight ? '' : `<div class="stepper">
-        <button data-step="weight:-1">−</button>
-        <div class="stepper-val">${fmtW(L.weight)}<small>LB ${esc(ex.loadLabel === 'bar' ? '' : ex.loadLabel).toUpperCase()}</small></div>
-        <button data-step="weight:1">+</button>
+        <button data-step="weight:-1" aria-label="Decrease weight">−</button>
+        <div class="stepper-val" aria-live="polite">${fmtW(L.weight)}<small>LB ${esc(ex.loadLabel === 'bar' ? '' : ex.loadLabel).toUpperCase()}</small></div>
+        <button data-step="weight:1" aria-label="Increase weight">+</button>
       </div>`}
     </div>
     ${!isTimed && ex.loadLabel === 'bar' ? `<div class="plate-math" style="margin:-4px 0 12px">${plateText(ex, L.weight)}</div>` : ''}
-    <div class="effort-row">
-      <button class="effort-btn ${L.effort === 'easy' ? 'sel-easy' : ''}" data-eff="easy">Easy</button>
-      <button class="effort-btn ${L.effort === 'solid' ? 'sel-solid' : ''}" data-eff="solid">Solid</button>
-      <button class="effort-btn ${L.effort === 'grind' ? 'sel-grind' : ''}" data-eff="grind">Grind</button>
+    <div class="effort-row" role="group" aria-label="Effort">
+      <button class="effort-btn ${L.effort === 'easy' ? 'sel-easy' : ''}" data-eff="easy" aria-pressed="${L.effort === 'easy'}">Easy</button>
+      <button class="effort-btn ${L.effort === 'solid' ? 'sel-solid' : ''}" data-eff="solid" aria-pressed="${L.effort === 'solid'}">Solid</button>
+      <button class="effort-btn ${L.effort === 'grind' ? 'sel-grind' : ''}" data-eff="grind" aria-pressed="${L.effort === 'grind'}">Grind</button>
     </div>
-    ${L.showNote ? `<textarea id="setNote" rows="2" placeholder="Note — form cue, pain, anything worth telling coach…">${esc(L.note)}</textarea>` : ''}
+    ${L.showNote ? `<textarea id="setNote" rows="2" aria-label="Set note" placeholder="Note — form cue, pain, anything worth telling coach…">${esc(L.note)}</textarea>` : ''}
     <div class="btn-row">
       <button class="btn-ghost" id="noteToggle">${L.showNote ? 'Hide note' : '+ Note'}</button>
-      <button class="btn" id="saveSet" style="flex:2">Log set</button>
+      ${L.editing ? `<button class="btn-ghost danger" id="deleteSet">Delete set</button>` : ''}
+      <button class="btn" id="saveSet" style="flex:2">${L.editing ? 'Save set' : 'Log set'}</button>
     </div>
   </div>`;
+}
+
+// Re-render just the open logger (stepper/effort taps) instead of the whole workout.
+function refreshLogger() {
+  const el = view.querySelector('.logger');
+  const ex = openLogger && exById(openLogger.exId);
+  if (!el || !ex) return render();
+  el.outerHTML = loggerHTML(ex);
+  wireLogger();
 }
 
 function wireLogger() {
   if (!openLogger) return;
   const ex = exById(openLogger.exId);
   const isTimed = ex.type === 'timed';
+  const keepNote = () => { const noteEl = $('#setNote'); if (noteEl) openLogger.note = noteEl.value; };
   view.querySelectorAll('[data-step]').forEach(b => b.onclick = () => {
     const [field, dir] = b.dataset.step.split(':');
-    const noteEl = $('#setNote'); if (noteEl) openLogger.note = noteEl.value;
+    keepNote();
     if (field === 'reps') openLogger.reps = Math.max(isTimed ? 5 : 1, openLogger.reps + (isTimed ? 5 : 1) * +dir);
-    else openLogger.weight = Math.max(0, +(openLogger.weight + ex.increment * +dir).toFixed(1));
-    render();
+    else openLogger.weight = Math.max(0, +(openLogger.weight + (ex.increment || 2.5) * +dir).toFixed(1));
+    refreshLogger();
   });
   view.querySelectorAll('[data-eff]').forEach(b => b.onclick = () => {
-    const noteEl = $('#setNote'); if (noteEl) openLogger.note = noteEl.value;
-    openLogger.effort = b.dataset.eff; render();
+    keepNote();
+    openLogger.effort = b.dataset.eff; refreshLogger();
   });
   const nt = $('#noteToggle');
   if (nt) nt.onclick = () => {
-    const noteEl = $('#setNote'); if (noteEl) openLogger.note = noteEl.value;
-    openLogger.showNote = !openLogger.showNote; render();
+    keepNote();
+    openLogger.showNote = !openLogger.showNote; refreshLogger();
+    const ta = $('#setNote'); if (ta) ta.focus();
+  };
+  const del = $('#deleteSet');
+  if (del) del.onclick = () => {
+    const L = openLogger;
+    confirmModal('Delete this set?', `Set ${L.setIdx + 1} of ${ex.name} is removed from today's workout.`, () => {
+      const entry = S.active.entries[L.exId];
+      entry.sets.splice(L.setIdx, 1);
+      openLogger = null;
+      save(); render(); toast('Set deleted.');
+    });
   };
   const sv = $('#saveSet');
   if (sv) sv.onclick = () => {
-    const noteEl = $('#setNote'); if (noteEl) openLogger.note = noteEl.value;
+    keepNote();
     const L = openLogger;
     const entry = S.active.entries[L.exId];
+    const idx = Math.min(L.setIdx, entry.sets.length); // never leave a gap
+    const prior = entry.sets[idx];
     const setData = { reps: L.reps, weight: isTimed || ex.type === 'bodyweight' ? 0 : L.weight, effort: L.effort, note: (L.note || '').trim() };
-    const isEdit = !!entry.sets[L.setIdx];
-    entry.sets[L.setIdx] = setData;
+    const t = prior ? prior.t : Date.now(); // when the set was first logged (additive field)
+    if (t) setData.t = t;
+    entry.sets[idx] = setData;
     if (entry.target == null) entry.target = setData.weight;
     openLogger = null;
     save(); render();
-    if (!isEdit && entry.sets.length < exById(L.exId).sets + 3) {
+    if (!prior && entry.sets.length < ex.sets + 3) {
       startRest(isCompound(ex) ? S.settings.restCompound : S.settings.restDefault);
     }
   };
@@ -585,7 +637,7 @@ function addBonusExercise(name, type) {
   openLogger = null;
   save(); render();
   const card = [...view.querySelectorAll('.ex-card')].pop();
-  if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  if (card) card.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
 }
 
 // ---- finish flow ------------------------------------------------
@@ -665,7 +717,12 @@ function progressionModal() {
 
 function completeWorkout(sugResults) {
   const a = S.active;
-  a.minutes = Math.max(1, Math.round((Date.now() - a.startedAt) / 60000));
+  // A workout left open (e.g. overnight) shouldn't record a 900-minute session: if the last
+  // logged set was 30+ min ago, end the clock there.
+  const setTimes = Object.values(a.entries).flatMap(e => e.sets.map(x => x.t || 0));
+  const lastSetAt = Math.max(0, ...setTimes);
+  const endAt = lastSetAt && Date.now() - lastSetAt > 30 * 60000 ? lastSetAt : Date.now();
+  a.minutes = Math.max(1, Math.round((endAt - a.startedAt) / 60000));
   a.suggestions = sugResults.map(s => ({ exId: s.exId, kind: s.kind, to: s.to, applied: s.applied }));
   // prune empty entries
   Object.keys(a.entries).forEach(k => { if (!a.entries[k].sets.length) delete a.entries[k]; });

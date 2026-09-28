@@ -275,3 +275,6 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 .banner.danger { background: var(--red-soft); border: 1px solid var(--red); }
 .banner b { display: block; margin-bottom: 2px; }
 .link { color: var(--accent); font-weight: 700; }
+.banner.warn { background: var(--accent-soft); border: 1px solid var(--accent); }
+.set-dot.extra { border-style: solid; border-color: var(--line); color: var(--text-dim); font-size: 1.2rem; }
+.btn-ghost.danger { color: var(--red); border-color: var(--red); }
