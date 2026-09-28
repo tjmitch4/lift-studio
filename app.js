@@ -114,7 +114,16 @@ function load() {
   try {
     return normalize(JSON.parse(raw));
   } catch (e) {
-    try { localStorage.setItem(LS_KEY + '.corrupt-' + Date.now(), raw); } catch (e2) {}
+    // keep one copy of the raw text aside — but not a fresh copy on every launch, which
+    // would eat the ~5 MB localStorage quota while the banner is up
+    try {
+      let kept = false;
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf(LS_KEY + '.corrupt-') === 0 && localStorage.getItem(k) === raw) { kept = true; break; }
+      }
+      if (!kept) localStorage.setItem(LS_KEY + '.corrupt-' + Date.now(), raw);
+    } catch (e2) {}
     loadProblem = { raw, error: String((e && e.message) || e) };
     console.error('Lift Studio: saved data unreadable', e);
     return freshState();
@@ -944,10 +953,11 @@ function parseWatchDuration(v) {
   const s = String(v).trim().toLowerCase();
   // unit words, e.g. '1 hr 5 min', '45 min', '1h 5m 30s', '2 hours'
   const unit = re => { const m = s.match(re); return m ? parseFloat(m[1]) : 0; };
-  if (/\d\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)\b/.test(s)) {
-    const h = unit(/(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\b/);
-    const m = unit(/(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)\b/);
-    const sec = unit(/(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b/);
+  // (?![a-z]) rather than \b so compact forms like '1h5m' still split: \b fails between 'h' and '5'
+  if (/\d\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)(?![a-z])/.test(s)) {
+    const h = unit(/(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)(?![a-z])/);
+    const m = unit(/(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)(?![a-z])/);
+    const sec = unit(/(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)(?![a-z])/);
     const total = Math.round(h * 60 + m + sec / 60);
     return total > 0 ? total : null;
   }
