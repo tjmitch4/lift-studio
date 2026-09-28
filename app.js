@@ -217,10 +217,31 @@ function plateText(ex, weight) {
   }
   return '';
 }
-function loadableRound(ex, w) {
-  // round a weight to something actually loadable / sensible
-  if (ex.loadLabel === 'bar') return Math.round(w / 5) * 5;          // 2.5 pair -> 5lb bar steps
-  return Math.round(w / 2.5) * 2.5;
+function isLoadable(ex, w) {
+  const st = S.settings;
+  if (ex.loadLabel === 'bar') {
+    const perSide = (w - st.barWeight) / 2;
+    return perSide >= 0 && greedy(perSide, st.platePairs).rem <= 0.01;
+  }
+  if (ex.loadLabel === 'sleeve') return greedy(w, st.platePairs.flatMap(p => [p, p])).rem <= 0.01;
+  return true;
+}
+function loadableRound(ex, w, dir) {
+  // round a weight to something actually loadable with the configured plates.
+  // dir: 1 = prefer at/above w (move-ups), -1 = prefer at/below w (deloads)
+  const plateLoaded = ex.loadLabel === 'bar' || ex.loadLabel === 'sleeve';
+  if (!plateLoaded) return Math.round(w / 2.5) * 2.5;
+  const smallest = Math.min(...S.settings.platePairs);
+  const step = ex.loadLabel === 'bar' ? smallest * 2 : smallest;
+  const start = (dir === -1 ? Math.floor(w / step + 1e-9) : dir === 1 ? Math.ceil(w / step - 1e-9) : Math.round(w / step)) * step;
+  const dirs = dir === -1 ? [-1] : dir === 1 ? [1] : [1, -1];
+  for (let k = 0; k <= 40; k++) {
+    for (const d of dirs) {
+      const c = +(start + d * k * step).toFixed(2);
+      if (c > 0 && isLoadable(ex, c)) return c;
+    }
+  }
+  return ex.loadLabel === 'bar' ? Math.round(w / 5) * 5 : Math.round(w / 2.5) * 2.5;
 }
 
 // ---- progression ------------------------------------------------
@@ -230,11 +251,15 @@ function exHistory(exId) {
     .filter(s => s.entries[exId] && s.entries[exId].sets.length)
     .map(s => ({ date: s.date, sessionId: s.id, target: s.entries[exId].target, sets: s.entries[exId].sets }));
 }
-function resultOf(ex, sets) {
-  // 'top' = every set at/above repHigh; 'miss' = any set below repLow; else 'work'
+function resultOf(ex, sets, target) {
+  // 'top'  = every planned set logged, all at/above repHigh, none lighter than the target
+  // 'miss' = any set below repLow; else 'work'
+  sets = (sets || []).filter(Boolean);
   if (!sets.length) return 'none';
-  if (sets.every(st => st.reps >= ex.repHigh)) return 'top';
   if (sets.some(st => st.reps < ex.repLow)) return 'miss';
+  const weighted = ex.type !== 'bodyweight' && ex.type !== 'timed' && target != null;
+  const fullWeight = !weighted || sets.every(st => st.weight >= target - 1e-9);
+  if (sets.length >= ex.sets && fullWeight && sets.every(st => st.reps >= ex.repHigh)) return 'top';
   return 'work';
 }
 function computeSuggestions(session) {
@@ -251,32 +276,38 @@ function computeSuggestions(session) {
       if (w != null) out.push({ exId, kind: 'set', from: null, to: w, msg: `First weight logged — set <b>${fmtW(w)} lb</b> as the working target?` });
       continue;
     }
+    if (ex.bonus) continue; // bonus lifts never trigger progression rules
 
     const hist = [...exHistory(exId), { target: entry.target, sets: entry.sets }];
-    const res = h => resultOf(ex, h.sets);
 
     if (ex.type === 'timed') {
-      const streak = countStreak(hist, h => h.sets.every(st => st.reps >= ex.repHigh));
+      const streak = countStreak(hist, h => h.sets.length >= ex.sets && h.sets.every(st => st.reps >= ex.repHigh));
       if (streak >= S.settings.progressAfter) {
         out.push({ exId, kind: 'time', from: ex.repHigh, to: ex.repHigh + 15, msg: `${streak} straight sessions holding ${ex.repHigh}s — bump the target to <b>${ex.repHigh + 15}s</b>?` });
       }
       continue;
     }
 
-    // streaks only count sessions at the current target weight
-    const atW = hist.filter(h => h.target === ex.weight);
-    const topStreak = countStreak(atW, h => res(h) === 'top');
-    const missStreak = countStreak(atW, h => res(h) === 'miss');
+    // Streaks run over the full date-ordered history: a session at any other target
+    // weight (e.g. before a deload or move-up) breaks the streak.
+    const { topStreak, missStreak } = streaks(ex, hist);
 
     if (topStreak >= S.settings.progressAfter) {
-      const to = loadableRound(ex, ex.weight + ex.increment);
+      const to = loadableRound(ex, ex.weight + ex.increment, 1);
       out.push({ exId, kind: 'up', from: ex.weight, to, msg: `<b>${topStreak} straight sessions</b> at the top of the range. Move up: <b>${fmtW(ex.weight)} → ${fmtW(to)} lb</b>, aim for ${ex.repLow} reps.` });
     } else if (missStreak >= S.settings.deloadAfter) {
-      const to = loadableRound(ex, ex.weight * (1 - S.settings.deloadPct));
-      out.push({ exId, kind: 'down', from: ex.weight, to, msg: `<b>${missStreak} sessions stalled</b> at ${fmtW(ex.weight)} lb. Deload ~10%: <b>${fmtW(to)} lb</b>, build back up.` });
+      const to = loadableRound(ex, ex.weight * (1 - S.settings.deloadPct), -1);
+      out.push({ exId, kind: 'down', from: ex.weight, to, msg: `<b>${missStreak} sessions stalled</b> at ${fmtW(ex.weight)} lb. Deload ~${Math.round(S.settings.deloadPct * 100)}%: <b>${fmtW(to)} lb</b>, build back up.` });
     }
   }
   return out;
+}
+function streaks(ex, hist) {
+  const at = h => h.target === ex.weight;
+  return {
+    topStreak: countStreak(hist, h => at(h) && resultOf(ex, h.sets, h.target) === 'top'),
+    missStreak: countStreak(hist, h => at(h) && resultOf(ex, h.sets, h.target) === 'miss'),
+  };
 }
 function countStreak(arr, pred) {
   let n = 0;
@@ -1059,8 +1090,8 @@ function coachReport() {
   const flags = [];
   S.exercises.forEach(ex => {
     if (ex.type === 'timed' || ex.weight == null) return;
-    const hist = exHistory(ex.id).filter(h => h.target === ex.weight);
-    const missStreak = countStreak(hist, h => resultOf(ex, h.sets) === 'miss');
+    const hist = exHistory(ex.id);
+    const { missStreak } = streaks(ex, hist);
     if (missStreak >= 2) flags.push(`${ex.name} has stalled ${missStreak} sessions at ${fmtW(ex.weight)} lb`);
     const last = hist[hist.length - 1];
     if (last && last.sets.filter(x => x.effort === 'grind').length >= 2) flags.push(`${ex.name}: multiple grind sets last session`);
