@@ -29,8 +29,13 @@ dedupes, running it repeatedly is harmless.
 
 ## Importing
 
-Lift Studio → **Cardio** tab → **Apple Watch → Import** → pick `watch-workouts.csv`
-from Dropbox. The importer:
+**With Dropbox sync on (Coach tab → Connect Dropbox): nothing to do.** Every sync checks
+`/TJ/Fitness/watch-workouts.csv`; when the shortcut has written a new version, Lift Studio
+imports it automatically on whichever device syncs first (the others get the entries via
+sync — ids are deterministic, so no duplicates). A missing file is ignored.
+
+Without sync: Lift Studio → **Cardio** tab → **Apple Watch → Import** → pick
+`watch-workouts.csv` from Dropbox. Either way, the importer:
 
 - maps Health types → app kinds: Basketball→Hoops, Tennis/Pickleball→Tennis,
   Rowing→Row, Running→Run, Walking/Hiking→Walk, anything else→Other (raw name kept
@@ -39,6 +44,7 @@ from Dropbox. The importer:
   Coach Report)
 - skips anything already imported, and skips manual entries that look like the same
   workout (same day + kind, within 5 min duration)
+- never re-imports a watch entry you deleted in the app
 
 On the Mac, the same file sits in Dropbox at `TJ Mitchell/TJ/Fitness/watch-workouts.csv`,
 so Claude can read it directly during coaching even before an import.
@@ -49,7 +55,3 @@ The App Store app **Health Auto Export — JSON+CSV** can do this on a schedule 
 Shortcut: create an automation exporting **Workouts** as **JSON** to Dropbox. The
 importer accepts its JSON format too (`data.workouts[...]`).
 
-## Later (GitHub backend)
-
-Same shortcut, one change: replace **Save File** with **Get Contents of URL** (POST the
-combined text to the backend). Imports then happen automatically — no file picking.

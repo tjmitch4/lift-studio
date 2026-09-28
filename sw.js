@@ -2,12 +2,16 @@
    Bump CACHE_VERSION when the precache list changes; stale caches are deleted on activate. */
 'use strict';
 
-const CACHE_VERSION = 'lift-studio-v2';
+const CACHE_VERSION = 'lift-studio-v3';
 const PRECACHE = [
   './',
   './index.html',
   './styles.css',
+  './config.js',
   './program.js',
+  './sync-merge.js',
+  './state.js',
+  './dropbox-sync.js',
   './app.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
@@ -42,7 +46,11 @@ self.addEventListener('fetch', event => {
   const req = event.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
+  // Never touch Dropbox (auth + API + content): those go straight to the network, uncached.
+  if (/(^|\.)dropbox(api)?\.com$/.test(url.hostname)) return;
   if (url.origin !== self.location.origin) return;
+  // tests/ pages are dev tools, not part of the offline app
+  if (url.pathname.indexOf('/tests/') !== -1) return;
 
   const fromCache = () => caches.match(req, { ignoreSearch: true }).then(hit => {
     if (hit) return hit;

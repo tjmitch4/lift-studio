@@ -2,110 +2,15 @@
 'use strict';
 
 // ============================================================ state
+// Shape + normalize()/freshState() live in state.js; the sync merge in sync-merge.js.
 const LS_KEY = 'liftstudio.v1';
-
-function freshState() {
-  return {
-    settings: { ...SEED_PROGRAM.settings },
-    exercises: SEED_PROGRAM.exercises.map(e => ({ ...e })),
-    days: SEED_PROGRAM.days.map(d => ({ ...d })),
-    sessions: [],   // completed workouts
-    cardio: [],     // cardio/sport entries
-    events: [],     // progression events (for coach report)
-    active: null,   // in-flight workout
-    schemaVersion: SCHEMA_VERSION,
-  };
-}
-
-// Bump when normalize() learns a new migration. Every migration is additive: fields are only
-// ever defaulted, coerced or repaired — never renamed or dropped.
-const SCHEMA_VERSION = 2;
-const EFFORTS = ['easy', 'solid', 'grind'];
-const BODY_CHECKS = ['good', 'tight', 'pain'];
-
-// Forward-migrate + sanitize a stored or imported state object. Used by load() and Import JSON.
-// Throws only when the input is not a Lift Studio state at all.
-function normalize(st) {
-  if (!st || typeof st !== 'object' || Array.isArray(st)) throw new Error('not a Lift Studio state');
-  const arr = v => (Array.isArray(v) ? v : []);
-  const num = (v, d = 0) => { const n = Number(v); return v !== null && v !== '' && isFinite(n) ? n : d; };
-  const numOrNull = v => num(v, null);
-  const str = v => (v == null ? '' : String(v));
-
-  // settings: seed defaults + stored values
-  const set = { ...SEED_PROGRAM.settings, ...(st.settings && typeof st.settings === 'object' ? st.settings : {}) };
-  Object.keys(SEED_PROGRAM.settings).forEach(k => {
-    if (k !== 'platePairs') set[k] = num(set[k], SEED_PROGRAM.settings[k]);
-  });
-  set.platePairs = arr(set.platePairs).map(Number).filter(x => isFinite(x) && x > 0);
-  if (!set.platePairs.length) set.platePairs = [...SEED_PROGRAM.settings.platePairs];
-  st.settings = set;
-
-  // exercises: keep stored ones (coerced), merge any new seed exercises
-  st.exercises = arr(st.exercises).filter(e => e && typeof e === 'object' && e.id != null).map(e => ({
-    ...e,
-    id: str(e.id), name: str(e.name || e.id), type: str(e.type), loadLabel: str(e.loadLabel),
-    day: e.day == null ? null : str(e.day),
-    sets: Math.max(1, num(e.sets, 3)), repLow: num(e.repLow, 8), repHigh: num(e.repHigh, 10),
-    weight: numOrNull(e.weight), increment: num(e.increment, 0),
-  }));
-  const have = new Set(st.exercises.map(e => e.id));
-  SEED_PROGRAM.exercises.forEach(e => { if (!have.has(e.id)) st.exercises.push({ ...e }); });
-
-  st.days = arr(st.days).filter(d => d && d.id != null).map(d => ({ ...d, id: str(d.id), name: str(d.name || d.id) }));
-  if (!st.days.length) st.days = SEED_PROGRAM.days.map(d => ({ ...d }));
-
-  // sessions / active workout. Repairs sets arrays holding null (out-of-order set taps
-  // in older versions left holes that JSON saved as null).
-  const normEntries = entries => {
-    const out = {};
-    if (!entries || typeof entries !== 'object') return out;
-    Object.keys(entries).forEach(k => {
-      const e = entries[k];
-      if (!e || typeof e !== 'object') return;
-      out[k] = {
-        ...e,
-        target: numOrNull(e.target),
-        sets: arr(e.sets).filter(x => x && typeof x === 'object').map(x => ({
-          ...x,
-          reps: num(x.reps), weight: num(x.weight),
-          effort: EFFORTS.includes(x.effort) ? x.effort : 'solid',
-          note: typeof x.note === 'string' ? x.note : '',
-        })),
-      };
-    });
-    return out;
-  };
-  const normSession = s => {
-    // (uid() isn't defined yet when load() runs at startup — inline it)
-    const o = { ...s, id: str(s.id || 's' + Math.random().toString(36).slice(2, 9) + Date.now().toString(36)), day: str(s.day), date: str(s.date), entries: normEntries(s.entries) };
-    if (o.bodyCheck != null && !BODY_CHECKS.includes(o.bodyCheck)) o.bodyCheck = null;
-    if (o.bodyNote != null) o.bodyNote = str(o.bodyNote);
-    if (o.minutes != null) o.minutes = num(o.minutes, null);
-    return o;
-  };
-  st.sessions = arr(st.sessions).filter(s => s && typeof s === 'object').map(normSession);
-  st.active = st.active && typeof st.active === 'object' ? normSession(st.active) : null;
-  if (st.active) {
-    st.active.startedAt = num(st.active.startedAt, Date.now());
-    if (st.active.restEndAt != null) st.active.restEndAt = num(st.active.restEndAt, 0);
-  }
-
-  st.cardio = arr(st.cardio).filter(c => c && typeof c === 'object').map(c => ({
-    ...c,
-    date: str(c.date), kind: str(c.kind || 'Other'), minutes: num(c.minutes),
-    distance: str(c.distance), note: str(c.note),
-    hr: numOrNull(c.hr), cal: numOrNull(c.cal),
-  }));
-  st.events = arr(st.events).filter(e => e && typeof e === 'object');
-  st.schemaVersion = SCHEMA_VERSION;
-  return st;
-}
 
 // loadProblem: saved data exists but could not be read. The raw text is kept aside and
 // save() refuses to write, so a parse bug can never silently overwrite TJ's real log.
 let loadProblem = null;
 let saveFailed = false;
+let sync = null;             // Dropbox sync engine (null when DROPBOX_APP_KEY is empty)
+let applyingRemote = false;  // true while saving a merged copy that came from Dropbox
 let S = load();
 function load() {
   let raw = null;
@@ -134,6 +39,7 @@ function save() {
   try {
     localStorage.setItem(LS_KEY, JSON.stringify(S));
     if (saveFailed) { saveFailed = false; render(); }
+    if (sync && !applyingRemote) sync.schedule(); // push to Dropbox 2s after the last change
   } catch (e) {
     console.error('Lift Studio: save failed', e && e.name, e);
     if (!saveFailed) { saveFailed = true; render(); toast("Couldn't save — export a backup now."); }
@@ -167,6 +73,24 @@ const dayName = id => (S.days.find(d => d.id === id) || {}).name || id;
 const isCompound = ex => ex.type === 'barbell';
 const uid = () => 's' + Math.random().toString(36).slice(2, 9) + Date.now().toString(36);
 
+// ---- sync bookkeeping (every mutation stamps what it changed; see sync-merge.js) ----
+// the in-flight workout changed (not for rest-timer housekeeping: a device that merely
+// reloads must never out-stamp sets logged on another device)
+const touchActive = () => { S.activeUpdatedAt = Date.now(); };
+// exercise fields changed (per-field last-write-wins)
+function touchEx(ex, fields) {
+  const now = Date.now();
+  ex.fieldTs = ex.fieldTs || {};
+  fields.forEach(f => { ex.fieldTs[f] = now; });
+  ex.updatedAt = now;
+}
+// delete a synced record: drop it and keep a tombstone so the delete reaches other devices
+function tombstone(kind, id) {
+  S[kind] = S[kind].filter(r => r.id !== id);
+  S.tombstones[kind] = (S.tombstones[kind] || []).filter(t => t.id !== id);
+  S.tombstones[kind].push({ id, deleted: true, updatedAt: Date.now() });
+}
+
 function toast(msg) {
   const t = document.createElement('div');
   t.className = 'toast'; t.textContent = msg;
@@ -194,6 +118,9 @@ function backupAgeText() {
     : d === 0 ? 'Last backup: today.' : `Last backup: ${d} day${d > 1 ? 's' : ''} ago.`;
 }
 function backupOverdue() {
+  // Dropbox sync is the backup: no nag while it's working
+  const ss = sync && sync.signedIn() ? sync.getStatus() : null;
+  if (ss && ss.lastSyncedAt && Date.now() - ss.lastSyncedAt < 14 * 86400000) return false;
   const d = backupDays();
   return S.sessions.length > 0 && (d == null || d > 14);
 }
@@ -453,7 +380,7 @@ function startWorkout(dayId) {
     S.active.entries[e.id] = { target: e.weight, sets: [] };
   });
   openLogger = null;
-  save(); render();
+  touchActive(); save(); render();
 }
 
 function renderActive() {
@@ -533,7 +460,7 @@ function renderActive() {
   $('#finishWo') && ($('#finishWo').onclick = finishFlow);
   $('#cancelWo') && ($('#cancelWo').onclick = () => confirmModal(
     'Discard this workout?', 'Logged sets from this session will be lost.',
-    () => { S.active = null; openLogger = null; endRest(false); save(); render(); }));
+    () => { S.active = null; openLogger = null; endRest(false); touchActive(); save(); render(); }));
 }
 
 function activeMinutes() {
@@ -630,17 +557,19 @@ function wireLogger() {
   if (del) del.onclick = () => {
     const L = openLogger;
     confirmModal('Delete this set?', `Set ${L.setIdx + 1} of ${ex.name} is removed from today's workout.`, () => {
-      const entry = S.active.entries[L.exId];
+      const entry = S.active && S.active.entries[L.exId];
+      if (!entry) { openLogger = null; return render(); }
       entry.sets.splice(L.setIdx, 1);
       openLogger = null;
-      save(); render(); toast('Set deleted.');
+      touchActive(); save(); render(); toast('Set deleted.');
     });
   };
   const sv = $('#saveSet');
   if (sv) sv.onclick = () => {
     keepNote();
     const L = openLogger;
-    const entry = S.active.entries[L.exId];
+    const entry = S.active && S.active.entries[L.exId];
+    if (!entry) { openLogger = null; return render(); } // workout finished on another device
     const idx = Math.min(L.setIdx, entry.sets.length); // never leave a gap
     const prior = entry.sets[idx];
     const setData = { reps: L.reps, weight: isTimed || ex.type === 'bodyweight' ? 0 : L.weight, effort: L.effort, note: (L.note || '').trim() };
@@ -649,7 +578,7 @@ function wireLogger() {
     entry.sets[idx] = setData;
     if (entry.target == null) entry.target = setData.weight;
     openLogger = null;
-    save(); render();
+    touchActive(); save(); render();
     if (!prior && entry.sets.length < ex.sets + 3) {
       startRest(isCompound(ex) ? S.settings.restCompound : S.settings.restDefault);
     }
@@ -715,11 +644,13 @@ function addBonusExercise(name, type) {
       weight: type === 'bodyweight' ? 0 : null,
       increment: type === 'barbell' ? 5 : type === 'bodyweight' ? 0 : 2.5,
     };
+    touchEx(ex, Object.keys(ex).filter(k => k !== 'id'));
     S.exercises.push(ex);
   }
+  if (!S.active) { save(); return render(); }
   if (!S.active.entries[ex.id]) S.active.entries[ex.id] = { target: ex.weight, sets: [] };
   openLogger = null;
-  save(); render();
+  touchActive(); save(); render();
   const card = [...view.querySelectorAll('.ex-card')].pop();
   if (card) card.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
 }
@@ -753,8 +684,10 @@ function bodyCheckModal(next) {
     b.className = 'effort-btn ' + (choice === 'good' ? 'sel-easy' : choice === 'tight' ? 'sel-solid' : 'sel-grind');
   });
   $('#bcNext').onclick = () => {
+    if (!S.active) { closeModal(); return render(); }
     S.active.bodyCheck = choice;
     S.active.bodyNote = ($('#bcNote').value || '').trim();
+    touchActive();
     closeModal(); next();
   };
 }
@@ -786,15 +719,17 @@ function progressionModal() {
     b.style.opacity = 1;
   });
   $('#progDone').onclick = () => {
+    if (!S.active) { closeModal(); return render(); }
     const applied = [];
     sugs.forEach((sg, i) => {
       const act = decisions[i] || (sg.kind === 'set' ? 'apply' : 'skip'); // TBD adoption defaults to apply
       if (act !== 'apply') { applied.push({ ...sg, applied: false }); return; }
       const ex = exById(sg.exId);
-      if (sg.kind === 'time') { ex.repLow = sg.to; ex.repHigh = sg.to; }
-      else ex.weight = sg.to;
+      if (!ex) return;
+      if (sg.kind === 'time') { ex.repLow = sg.to; ex.repHigh = sg.to; touchEx(ex, ['repLow', 'repHigh']); }
+      else { ex.weight = sg.to; touchEx(ex, ['weight']); }
       applied.push({ ...sg, applied: true });
-      S.events.push({ date: S.active.date, exId: sg.exId, kind: sg.kind, from: sg.from, to: sg.to });
+      S.events.push({ id: uid(), updatedAt: Date.now(), date: S.active.date, exId: sg.exId, kind: sg.kind, from: sg.from, to: sg.to });
     });
     closeModal();
     completeWorkout(applied);
@@ -803,6 +738,7 @@ function progressionModal() {
 
 function completeWorkout(sugResults) {
   const a = S.active;
+  if (!a) { closeModal(); return render(); } // finished/discarded on another device meanwhile
   // A workout left open (e.g. overnight) shouldn't record a 900-minute session: if the last
   // logged set was 30+ min ago, end the clock there.
   const setTimes = Object.values(a.entries).flatMap(e => e.sets.map(x => x.t || 0));
@@ -813,8 +749,11 @@ function completeWorkout(sugResults) {
   // prune empty entries
   Object.keys(a.entries).forEach(k => { if (!a.entries[k].sets.length) delete a.entries[k]; });
   delete a.startedAt;
+  delete a.restEndAt; delete a.restTotal;
+  a.updatedAt = Date.now();
   S.sessions.push(a);
   S.active = null; openLogger = null; coachReportCache = null;
+  touchActive();
   save(); render();
   toast('Workout saved — nice work.');
 }
@@ -874,7 +813,7 @@ function renderProgress() {
   view.querySelectorAll('[data-delsess]').forEach(b => b.onclick = () => {
     const s = S.sessions.find(x => x.id === b.dataset.delsess); if (!s) return;
     confirmModal('Delete this workout?', `${dayName(s.day)} on ${fmtDate(s.date)} is removed from history, charts and the coach report. Weight changes you already applied stay as they are.`, () => {
-      S.sessions = S.sessions.filter(x => x !== s);
+      tombstone('sessions', s.id);
       expandedSession = null; coachReportCache = null;
       save(); render(); toast('Workout deleted.');
     });
@@ -1016,15 +955,20 @@ function parseWatchFile(text) {
 }
 function mergeWatchEntries(parsed) {
   const seen = new Set(S.cardio.filter(c => c.wkey).map(c => c.wkey));
+  // entries deleted here (or on another device) stay deleted: their tombstone id matches
+  const deleted = new Set((S.tombstones.cardio || []).map(t => t.id));
   let added = 0, skipped = 0;
   for (const p of parsed) {
     const kind = mapWatchKind(p.rawKind);
     const wkey = `${p.date}|${kind}|${p.minutes}`;
+    const id = watchCardioId(wkey);
     // skip exact watch re-imports, and manual entries that look like the same workout
     const manualDupe = S.cardio.some(c => !c.wkey && c.date === p.date && c.kind === kind && Math.abs(c.minutes - p.minutes) <= 5);
-    if (seen.has(wkey) || manualDupe) { skipped++; continue; }
+    if (seen.has(wkey) || deleted.has(id) || manualDupe) { skipped++; continue; }
     seen.add(wkey);
     S.cardio.push({
+      // deterministic stamp: two devices importing the same row produce identical records
+      id, updatedAt: dateStamp(p.date),
       date: p.date, kind, minutes: p.minutes, distance: '',
       note: kind === 'Other' ? String(p.rawKind) : '',
       source: 'watch', hr: p.hr || null, cal: p.cal || null, wkey,
@@ -1079,12 +1023,11 @@ function renderCardio() {
     if (c.distance) meta.push(esc(c.distance));
     if (c.hr) meta.push(`${esc(c.hr)} bpm`);
     if (c.cal) meta.push(`${esc(c.cal)} cal`);
-    const idx = S.cardio.indexOf(c);
     html += `<div class="card cardio-item">
       <div class="hist-head"><div><b>${esc(c.kind)}</b> <span class="faint">· ${fmtDate(c.date)}</span>${c.source === 'watch' ? ' <span class="pill blue">watch</span>' : ''}</div>
       <div class="faint">${meta.join(' · ')}</div></div>
       ${c.note ? `<div class="faint" style="margin-top:4px">“${esc(c.note)}”</div>` : ''}
-      <div class="hist-actions"><button class="btn-ghost" data-delcardio="${idx}" aria-label="Delete ${esc(c.kind)} on ${esc(fmtDate(c.date))}">Delete</button></div>
+      <div class="hist-actions"><button class="btn-ghost" data-delcardio="${esc(c.id)}" aria-label="Delete ${esc(c.kind)} on ${esc(fmtDate(c.date))}">Delete</button></div>
     </div>`;
   });
   view.innerHTML = html;
@@ -1096,9 +1039,9 @@ function renderCardio() {
     });
   });
   view.querySelectorAll('[data-delcardio]').forEach(b => b.onclick = () => {
-    const c = S.cardio[+b.dataset.delcardio]; if (!c) return;
+    const c = S.cardio.find(x => x.id === b.dataset.delcardio); if (!c) return;
     confirmModal('Delete this entry?', `${c.kind} · ${c.minutes} min on ${fmtDate(c.date)} is removed.`, () => {
-      S.cardio = S.cardio.filter(x => x !== c);
+      tombstone('cardio', c.id);
       coachReportCache = null;
       save(); render(); toast('Entry deleted.');
     });
@@ -1123,7 +1066,7 @@ function renderCardio() {
     if (!mins || mins <= 0) return toast('How many minutes?');
     const dv = $('#cDate').value;
     const date = /^\d{4}-\d{2}-\d{2}$/.test(dv) && dv <= todayISO() ? dv : todayISO();
-    S.cardio.push({ date, kind: cardioKind, minutes: mins, distance: ($('#cDist').value || '').trim(), note: ($('#cNote').value || '').trim() });
+    S.cardio.push({ id: uid(), updatedAt: Date.now(), date, kind: cardioKind, minutes: mins, distance: ($('#cDist').value || '').trim(), note: ($('#cNote').value || '').trim() });
     S.cardio.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0); // stable: same-day order kept
     cardioKind = null; coachReportCache = null;
     save(); render(); toast('Logged.');
@@ -1217,23 +1160,19 @@ function coachReport() {
 
 function renderCoach() {
   const report = coachReport();
+  const synced = !!(sync && sync.signedIn());
   let html = `<div class="hero"><h2>Coach hand-off</h2>
-    <div class="muted">Copy the report below and paste it to Claude for a coaching review. Data lives only on this device — use Export JSON below to back it up.</div></div>
+    <div class="muted">Copy the report below and paste it to Claude for a coaching review. ${synced
+      ? 'Your log syncs to Dropbox automatically.'
+      : sync ? 'Data lives only on this device until you connect Dropbox sync below.'
+      : 'Data lives only on this device — use Export JSON below to back it up.'}</div></div>
   <div class="btn-row" style="margin-bottom:12px">
     <button class="btn" id="copyReport">Copy coach report</button>
   </div>
   <div class="coach-pre">${esc(report)}</div>
 
-  <div class="section-title">Backup</div>
-  <div class="card">
-    <div class="faint" style="margin-bottom:10px">${backupAgeText()}</div>
-    <div class="btn-row">
-      <button class="btn secondary" id="exportJson">Export JSON</button>
-      <button class="btn secondary" id="importJson">Import JSON</button>
-    </div>
-    ${hasPreImportBackup() ? `<button class="btn-ghost" id="undoImport" style="margin-top:10px;width:100%">Undo last import</button>` : ''}
-    <input type="file" id="importFile" accept=".json,application/json" class="hidden">
-  </div>
+  <div class="section-title">Sync</div>
+  <div class="card sync-card" id="syncCard">${syncCardHTML()}</div>
 
   <div class="section-title">Settings</div>
   <div class="card">
@@ -1247,8 +1186,20 @@ function renderCoach() {
       <input id="setRestC" type="number" inputmode="numeric" aria-label="Rest for barbell compounds, seconds" value="${S.settings.restCompound}"></div>
   </div>
   <div class="btn-row" style="margin-bottom:20px"><button class="btn secondary" id="saveSettings">Save settings</button></div>
+
+  <div class="section-title">Manual backup</div>
+  <div class="card backup-card">
+    <div class="faint" style="margin-bottom:10px">${synced ? 'Not needed with sync on — a JSON file is still handy as an extra copy.' : backupAgeText()}</div>
+    <div class="btn-row">
+      <button class="btn-ghost" id="exportJson">Export JSON</button>
+      <button class="btn-ghost" id="importJson">Import JSON</button>
+    </div>
+    ${hasPreImportBackup() && !synced ? `<button class="btn-ghost" id="undoImport" style="margin-top:10px;width:100%">Undo last import</button>` : ''}
+    <input type="file" id="importFile" accept=".json,application/json" class="hidden">
+  </div>
   <button class="btn danger" id="resetAll">Reset all data</button>`;
   view.innerHTML = html;
+  wireSyncCard();
 
   $('#copyReport').onclick = async () => {
     try { await navigator.clipboard.writeText(report); toast('Report copied — paste it to Claude.'); }
@@ -1271,6 +1222,16 @@ function renderCoach() {
         data = normalize(data);
       } catch (e) { return toast('That file did not look like a Lift Studio backup.'); }
       const here = loadProblem ? 'unreadable data' : `${S.sessions.length} workouts and ${S.cardio.length} cardio entries${S.active ? ' plus the workout in progress' : ''}`;
+      if (sync && sync.signedIn() && !loadProblem) {
+        // With sync on, "replace" would be undone by the next sync anyway: merge instead.
+        return confirmModal('Merge this backup?',
+          `This device has ${here}. The file has ${data.sessions.length} workouts and ${data.cardio.length} cardio entries. They're combined (nothing here is removed) and the result syncs to your other devices.`,
+          () => {
+            try { localStorage.setItem(LS_KEY + '.backup-pre-import', JSON.stringify(S)); } catch (e) {}
+            applyMerged(LiftMerge.mergeStates(S, data, { seed: SEED_PROGRAM }), true);
+            toast('Backup merged.');
+          });
+      }
       confirmModal('Replace all data?',
         `This device has ${here}. The file has ${data.sessions.length} workouts and ${data.cardio.length} cardio entries. Everything here is replaced; you can undo once from this screen.`,
         () => {
@@ -1291,16 +1252,229 @@ function renderCoach() {
     endRest(false); openLogger = null; coachReportCache = null; save(); render(); toast('Import undone.');
   });
   $('#saveSettings').onclick = () => {
+    const before = { ...S.settings };
     S.settings.barWeight = parseFloat($('#setBar').value) || 45;
     const plates = $('#setPlates').value.split(',').map(x => parseFloat(x.trim())).filter(x => x > 0);
     if (plates.length) S.settings.platePairs = plates;
     S.settings.restDefault = parseInt($('#setRest').value, 10) || 90;
     S.settings.restCompound = parseInt($('#setRestC').value, 10) || 150;
+    // stamp only the fields that changed, so a setting changed on another device survives
+    const now = Date.now();
+    Object.keys(S.settings).forEach(k => {
+      if (JSON.stringify(before[k]) !== JSON.stringify(S.settings[k])) S.settingsTs[k] = now;
+    });
     save(); toast('Settings saved.');
   };
-  $('#resetAll').onclick = () => confirmModal('Reset everything?', 'All workouts, cardio, and settings are wiped. Export a JSON backup first if unsure.',
-    () => { endRest(false); S = freshState(); loadProblem = null; openLogger = null; coachReportCache = null; save(); render(); toast('Fresh start.'); });
+  $('#resetAll').onclick = () => {
+    if (sync && sync.signedIn()) {
+      return confirmModal('Reset everywhere?', 'Sync is on, so this wipes all workouts, cardio and settings here, in Dropbox and on your other devices. Export a JSON backup first if unsure.',
+        () => { endRest(false); S = wipedState(); loadProblem = null; openLogger = null; coachReportCache = null; save(); render(); toast('Fresh start.'); });
+    }
+    confirmModal('Reset everything?', 'All workouts, cardio, and settings are wiped. Export a JSON backup first if unsure.',
+      () => { endRest(false); S = freshState(); loadProblem = null; openLogger = null; coachReportCache = null; save(); render(); toast('Fresh start.'); });
+  };
 }
+
+// A fresh state that *wins* a sync merge: every record becomes a tombstone and every
+// setting/target is re-stamped, so the reset reaches the other devices.
+function wipedState() {
+  const now = Date.now();
+  const f = normalize(freshState());
+  ['sessions', 'cardio', 'events'].forEach(k => {
+    const ids = new Set([...S[k].map(r => r.id), ...(S.tombstones[k] || []).map(t => t.id)]);
+    f.tombstones[k] = [...ids].map(id => ({ id, deleted: true, updatedAt: now }));
+  });
+  Object.keys(f.settings).forEach(k => { f.settingsTs[k] = now; });
+  f.exercises.forEach(ex => touchEx(ex, Object.keys(ex).filter(k => k !== 'id' && k !== 'fieldTs' && k !== 'updatedAt')));
+  f.activeUpdatedAt = now;
+  return f;
+}
+
+// ============================================================ dropbox sync (ui)
+const isStandalone = () => window.navigator.standalone === true ||
+  !!(window.matchMedia && matchMedia('(display-mode: standalone)').matches);
+// Code-flow authorize URL, prepared ahead of time so "use a code" can be a real link:
+// iOS blocks window.open() that happens after an await.
+let codeUrl = null;
+function prepareCodeUrl() {
+  if (!sync || sync.signedIn() || codeUrl) return;
+  sync.authUrl('code').then(u => { codeUrl = u; paintSync(); }).catch(() => {});
+}
+
+function agoText(ms) {
+  if (!ms) return 'never';
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 45) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} hr ago`;
+  return new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+const SYNC_LABEL = {
+  unconfigured: 'Sync not configured yet', signedout: 'Not connected', reauth: 'Dropbox sign-in expired',
+  idle: 'Connected', syncing: 'Syncing…', synced: 'Synced', offline: 'Offline — will retry', error: 'Sync problem',
+};
+function syncCardHTML() {
+  if (!sync) {
+    return `<div class="sync-line"><span class="sync-dot-inline s-unconfigured" aria-hidden="true"></span><b>Sync not configured yet</b></div>
+      <div class="faint">Dropbox sync switches on once the app key is added to <code>config.js</code>. Until then, use the manual backup below.</div>`;
+  }
+  const st = sync.getStatus();
+  const codeLink = (cls, id, text) =>
+    `<a class="${cls}" id="${id}" data-codelink href="${esc(codeUrl || '#')}" target="_blank" rel="noopener">${text}</a>`;
+  if (!st.signedIn) {
+    const expired = st.state === 'reauth';
+    let body;
+    if (st.pendingCode) {
+      body = `<label for="dbxCode" class="sync-code-label">Paste the code from Dropbox</label>
+        <input type="text" id="dbxCode" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Code from the Dropbox page">
+        <div class="btn-row" style="margin-top:10px">
+          <button class="btn-ghost" id="dbxCodeCancel">Cancel</button>
+          <button class="btn" id="dbxCodeSubmit" style="flex:2">Connect</button>
+        </div>
+        ${codeLink('link-btn', 'dbxCodeAgain', 'Open Dropbox again for a new code')}`;
+    } else if (isStandalone()) {
+      // home-screen app: a redirect would come back in Safari, not here — code flow it is
+      body = `${codeLink('btn', 'dbxCodeOpen', expired ? 'Reconnect Dropbox' : 'Connect Dropbox')}
+        <div class="faint sync-hint">Dropbox opens, you allow access, then copy the code it shows back into this app.</div>`;
+    } else {
+      body = `<button class="btn" id="dbxConnect">${expired ? 'Reconnect Dropbox' : 'Connect Dropbox'}</button>
+        ${codeLink('link-btn', 'dbxUseCode', 'Having trouble? Use a code instead')}`;
+    }
+    return `<div class="sync-line"><span class="sync-dot-inline s-${expired ? 'error' : 'signedout'}" aria-hidden="true"></span><b>${expired ? 'Dropbox sign-in expired' : 'Dropbox sync is off'}</b></div>
+      <div class="faint" style="margin-bottom:12px">Connect once on each device (phone, PC…) and your log stays in step automatically. What's already on this device is kept and merged — nothing is overwritten.</div>
+      ${body}`;
+  }
+  const label = SYNC_LABEL[st.state] || 'Connected';
+  const err = st.state === 'error' && st.lastError ? `<div class="sync-err">${esc(st.lastError)}</div>` : '';
+  return `<div class="sync-line"><span class="sync-dot-inline s-${esc(st.state)}" aria-hidden="true"></span><b>${label}</b>
+      <span class="faint sync-when">Last synced: ${agoText(st.lastSyncedAt)}</span></div>
+    ${err}
+    <div class="faint sync-path">Dropbox: ${esc((st.pathMode === 'root' ? DROPBOX_TEAM_PREFIX : '') + DROPBOX_DATA_PATH)}</div>
+    <div class="faint sync-path">Apple Watch workouts import automatically from ${esc(DROPBOX_WATCH_PATH.split('/').pop())}.</div>
+    <div class="btn-row" style="margin-top:12px">
+      <button class="btn-ghost" id="dbxSignOut">Sign out</button>
+      <button class="btn secondary" id="dbxSyncNow" style="flex:2" ${st.state === 'syncing' ? 'disabled' : ''}>${st.state === 'syncing' ? 'Syncing…' : 'Sync now'}</button>
+    </div>`;
+}
+function wireSyncCard() {
+  if (!sync) return;
+  const on = (id, fn) => { const el = $('#' + id); if (el) el.onclick = fn; };
+  view.querySelectorAll('[data-codelink]').forEach(a => a.onclick = ev => {
+    if (!codeUrl) { ev.preventDefault(); prepareCodeUrl(); return toast('One moment — try again.'); }
+    // let the link open Dropbox in a new tab/Safari, then show the paste box here
+    setTimeout(() => { sync.markCodeOpened(); const box = $('#dbxCode'); if (box) box.focus(); }, 0);
+  });
+  on('dbxConnect', async () => {
+    try { await sync.beginRedirect(); } catch (e) { toast(e.message); }
+  });
+  on('dbxCodeCancel', () => { sync.cancelCode(); codeUrl = null; prepareCodeUrl(); paintSync(); });
+  on('dbxCodeSubmit', async () => {
+    const code = ($('#dbxCode').value || '').trim();
+    if (!code) return toast('Paste the code from Dropbox first.');
+    const btn = $('#dbxCodeSubmit'); btn.disabled = true; btn.textContent = 'Connecting…';
+    try { $('#dbxCode').blur(); } catch (e) {}
+    try {
+      const pending = sync.completeCode(code);
+      await pending; codeUrl = null;
+      paintSync(); toast('Dropbox connected.');
+    } catch (e) {
+      btn.disabled = false; btn.textContent = 'Connect';
+      toast(e.kind === 'network' ? 'No connection — try again.' : 'That code didn\'t work — open Dropbox again for a new one.');
+    }
+  });
+  on('dbxSyncNow', () => sync.syncNow('manual'));
+  on('dbxSignOut', () => confirmModal('Sign out of Dropbox?', 'Sync stops on this device. Everything logged here stays here, and your Dropbox copy is untouched.', async () => {
+    await sync.signOut(); codeUrl = null; prepareCodeUrl(); render(); toast('Signed out of Dropbox.');
+  }));
+}
+// Repaint the header dot and (if visible) the sync card — never the whole view.
+function paintSync() {
+  const dot = $('#syncDot');
+  if (dot) {
+    const st = sync ? sync.getStatus() : { state: 'unconfigured' };
+    dot.classList.toggle('hidden', !sync);
+    [...dot.classList].filter(c => c.indexOf('s-') === 0).forEach(c => dot.classList.remove(c));
+    dot.classList.add('s-' + st.state);
+    const label = SYNC_LABEL[st.state] || 'Sync';
+    dot.setAttribute('aria-label', `Sync: ${label}. Open sync settings.`);
+    dot.title = st.lastSyncedAt ? `${label} · last synced ${agoText(st.lastSyncedAt)}` : label;
+  }
+  const card = $('#syncCard');
+  if (card) {
+    // don't wipe a half-typed code
+    const stillPasting = sync && !sync.signedIn() && sync.getStatus().pendingCode;
+    const typing = stillPasting && document.activeElement && document.activeElement.id === 'dbxCode';
+    if (!typing) {
+      const box = $('#dbxCode'), kept = box ? box.value : '';
+      card.innerHTML = syncCardHTML(); wireSyncCard();
+      const nb = $('#dbxCode'); if (nb && kept) nb.value = kept;
+    }
+  }
+}
+
+// Adopt a merged state (from Dropbox or a merged backup import) and repaint carefully.
+let renderDeferred = false;
+function applyMerged(merged, fromImport) {
+  S = merged;
+  coachReportCache = null;
+  applyingRemote = !fromImport;
+  try { save(); } finally { applyingRemote = false; }
+  if (!S.active) { openLogger = null; if (rest.endAt) endRest(false); }
+  else if (openLogger && !S.active.entries[openLogger.exId]) openLogger = null;
+  // re-rendering would wipe a field TJ is typing in: wait until he leaves it
+  const a = document.activeElement;
+  if (a && view.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) {
+    if (!renderDeferred) {
+      renderDeferred = true;
+      view.addEventListener('focusout', function once() {
+        view.removeEventListener('focusout', once);
+        setTimeout(() => { renderDeferred = false; render(); }, 0);
+      });
+    }
+  } else render();
+}
+
+function initSync() {
+  if (typeof DROPBOX_APP_KEY === 'undefined' || !DROPBOX_APP_KEY) { paintSync(); return; }
+  sync = LiftDropbox.create({
+    appKey: DROPBOX_APP_KEY,
+    storageKey: LS_KEY.replace(/\.v1$/, '') + '.dropbox',
+    dataPath: DROPBOX_DATA_PATH,
+    watchPath: DROPBOX_WATCH_PATH,
+    checkFolder: DROPBOX_CHECK_FOLDER,
+    teamPrefix: DROPBOX_TEAM_PREFIX,
+    getState: () => S,
+    applyState: merged => applyMerged(merged, false),
+    normalize,
+    merge: (a, b) => LiftMerge.mergeStates(a, b, { seed: SEED_PROGRAM }),
+    canSync: () => !loadProblem && !saveFailed,
+    isBusy: () => !!(modalOpts && !modalOpts.dismissable), // finish-workout sheets
+    importWatch: text => {
+      const parsed = parseWatchFile(String(text || ''));
+      if (!parsed.length) return 0;
+      const { added } = mergeWatchEntries(parsed);
+      if (added) { render(); toast(`Imported ${added} Apple Watch workout${added > 1 ? 's' : ''}.`); }
+      return added;
+    },
+    onStatus: paintSync,
+    // redirect flow: plain navigation (the code flow uses a real link, see prepareCodeUrl)
+    openUrl: url => { location.assign(url); },
+  });
+  paintSync();
+  prepareCodeUrl();
+  sync.attach(window, document);
+  sync.handleRedirect(location.href).then(r => {
+    if (r.handled) {
+      try { history.replaceState(null, '', r.cleanUrl); } catch (e) {}
+      if (r.ok) { toast('Dropbox connected.'); tab = 'coach'; render(); }
+      else if (r.message) toast(r.message);
+    }
+    return sync.syncNow(r.handled ? 'signin' : 'load');
+  });
+}
+
 
 // ============================================================ modal helpers
 // opts.dismissable=false: backdrop taps and Escape are ignored (finish-flow sheets, where a
@@ -1356,6 +1530,7 @@ function render() {
   else if (tab === 'cardio') renderCardio();
   else renderCoach();
   renderBanner();
+  paintSync();
 }
 
 // Data-safety banners pinned to the top of every tab.
@@ -1409,3 +1584,10 @@ if (S.active && S.active.restEndAt) {
   if (S.active.restEndAt > Date.now()) runRest(S.active.restEndAt, S.active.restTotal || 90);
   else { delete S.active.restEndAt; delete S.active.restTotal; save(); }
 }
+// header sync dot -> sync card on the Coach tab
+$('#syncDot').onclick = () => {
+  tab = 'coach'; openLogger = null; render();
+  const card = $('#syncCard');
+  if (card) card.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
+};
+initSync();

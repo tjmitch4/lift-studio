@@ -313,3 +313,40 @@ html, button, a, [role=button] { touch-action: manipulation; }
 .day-card .day-meta { display: block; }
 .cardio-form .form-row > div { min-width: 0; }
 .cardio-form input[type=date] { -webkit-appearance: none; appearance: none; display: block; min-width: 0; }
+
+/* ---------- dropbox sync ---------- */
+.topbar-right { display: flex; align-items: center; gap: 6px; }
+.sync-dot {
+  width: 44px; height: 44px; margin: -14px -12px -14px 0; /* big tap target, small footprint */
+  display: inline-flex; align-items: center; justify-content: center;
+  background: none; border: none; border-radius: 50%; cursor: pointer;
+}
+.sync-dot > span, .sync-dot-inline {
+  display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--text-faint); box-shadow: 0 0 0 3px var(--card-2);
+}
+.sync-dot-inline { width: 9px; height: 9px; margin-right: 8px; flex: none; box-shadow: none; }
+.s-synced > span, .sync-dot-inline.s-synced, .s-idle > span, .sync-dot-inline.s-idle { background: var(--green); }
+.s-syncing > span, .sync-dot-inline.s-syncing { background: var(--blue); animation: syncPulse 1s ease-in-out infinite alternate; }
+.s-offline > span, .sync-dot-inline.s-offline { background: var(--text-faint); }
+.s-error > span, .sync-dot-inline.s-error, .s-reauth > span, .sync-dot-inline.s-reauth { background: var(--red); }
+.s-signedout > span, .sync-dot-inline.s-signedout { background: transparent; box-shadow: inset 0 0 0 2px var(--accent); }
+.sync-dot-inline.s-unconfigured { background: transparent; box-shadow: inset 0 0 0 2px var(--text-faint); }
+@keyframes syncPulse { from { opacity: 1; } to { opacity: .35; } }
+.sync-line { display: flex; align-items: center; flex-wrap: wrap; gap: 2px 0; margin-bottom: 6px; font-size: .92rem; }
+.sync-when { margin-left: auto; padding-left: 10px; }
+.sync-path { margin-top: 4px; overflow-wrap: anywhere; }
+.sync-err { color: var(--red); font-size: .8rem; margin: 2px 0 4px; overflow-wrap: anywhere; }
+.sync-hint { margin-top: 8px; }
+.sync-card code { font-size: .78rem; background: var(--card-2); padding: 1px 5px; border-radius: 5px; }
+.sync-code-label { display: block; font-size: .82rem; font-weight: 700; color: var(--text-dim); margin-bottom: 6px; }
+.sync-card input[type=text] {
+  width: 100%; background: var(--card-2); border: 1px solid var(--line); border-radius: 10px; color: var(--text);
+  font: inherit; font-size: 16px; padding: 10px 12px; min-height: 44px;
+}
+a.btn { text-decoration: none; }
+.link-btn {
+  display: block; width: 100%; text-align: center; margin-top: 10px; padding: 10px 0; min-height: 44px;
+  color: var(--accent); font-weight: 700; font-size: .85rem; text-decoration: none; background: none; border: none; cursor: pointer;
+}
+.backup-card .btn-row .btn-ghost { flex: 1; }

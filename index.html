@@ -19,7 +19,10 @@
 <body>
 <header class="topbar">
   <div class="brand">Lift<span>Studio</span></div>
-  <div class="topbar-date" id="topbarDate"></div>
+  <div class="topbar-right">
+    <div class="topbar-date" id="topbarDate"></div>
+    <button class="sync-dot hidden" id="syncDot" type="button" aria-label="Sync status"><span aria-hidden="true"></span></button>
+  </div>
 </header>
 
 <main id="view" class="view"></main>
@@ -58,7 +61,11 @@
 <div id="modalRoot"></div>
 <div id="srLive" class="sr-only" aria-live="assertive"></div>
 
+<script src="config.js"></script>
 <script src="program.js"></script>
+<script src="sync-merge.js"></script>
+<script src="state.js"></script>
+<script src="dropbox-sync.js"></script>
 <script src="app.js"></script>
 <script>
   // Offline support: only register over https (GitHub Pages) or localhost.

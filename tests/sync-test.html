@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lift Studio — sync engine tests</title>
+<style>
+  body { font: 14px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; background: #0e1116; color: #e8ecf2; margin: 16px; }
+  h1 { font-size: 1.1rem; }
+  #summary { font-weight: 800; margin: 8px 0 14px; }
+  table { border-collapse: collapse; width: 100%; }
+  td { border-bottom: 1px solid #2a3342; padding: 6px 8px; vertical-align: top; }
+  .pass { color: #4cc38a; font-weight: 700; } .fail { color: #e5645f; font-weight: 700; }
+  code { color: #97a3b4; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+</style>
+</head>
+<body>
+<h1>Lift Studio — sync engine tests (mock Dropbox, two simulated devices)</h1>
+<div id="summary">running…</div>
+<table id="results"></table>
+
+<script src="../program.js"></script>
+<script src="../sync-merge.js"></script>
+<script src="../state.js"></script>
+<script src="../dropbox-sync.js"></script>
+<script>
+'use strict';
+const C = LiftMerge.canonical;
+const clone = v => JSON.parse(JSON.stringify(v));
+
+// ------------------------------------------------------------ mock Dropbox
+// namespaces: 'home' (member folder) and 'root' (team space). files: path(lowercase) -> {text, rev}
+function mockDropbox(opt = {}) {
+  const m = {
+    offline: false, calls: [], revN: 0,
+    ns: { home: new Map(), root: new Map() },
+    folders: { home: new Set(opt.homeFolders || ['/tj/fitness']), root: new Set(opt.rootFolders || []) },
+    tokens: new Set(), refresh: new Map(), revoked: new Set(),
+    beforeUpload: null, // hook(pathKey, nsName) run once before an upload is applied
+    expireAll() { m.tokens.clear(); },
+  };
+  const json = (status, body, headers) => new Response(JSON.stringify(body), { status, headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}) });
+  const err = (status, summary) => json(status, { error_summary: summary, error: {} });
+  const nsOf = h => {
+    const pr = h['Dropbox-API-Path-Root'];
+    if (!pr) return 'home';
+    const v = JSON.parse(pr);
+    return v['.tag'] === 'root' && v.root === '4242' ? 'root' : 'bad';
+  };
+  m.put = (ns, path, text) => { const rev = 'r' + (++m.revN); m.ns[ns].set(path.toLowerCase(), { text, rev, path }); return rev; };
+  m.get = (ns, path) => m.ns[ns].get(path.toLowerCase());
+  m.fetch = async (url, init = {}) => {
+    const h = init.headers || {};
+    const ep = url.replace(/^https:\/\/[^/]+\/(2\/)?/, '');
+    m.calls.push({ ep, h: clone(h), body: typeof init.body === 'string' ? init.body : null });
+    if (m.offline) throw new TypeError('Failed to fetch');
+    if (ep === 'oauth2/token') {
+      const p = new URLSearchParams(init.body);
+      if (p.get('client_id') !== 'testkey') return json(400, { error: 'invalid_client' });
+      if (p.get('grant_type') === 'authorization_code') {
+        if (p.get('code') !== 'GOODCODE' || !p.get('code_verifier')) return json(400, { error: 'invalid_grant', error_description: 'code doesn\'t exist or has expired' });
+        const at = 'at' + Math.random(), rt = 'rt' + Math.random();
+        m.tokens.add(at); m.refresh.set(rt, true);
+        return json(200, { access_token: at, expires_in: 14400, refresh_token: rt, account_id: 'dbid:TJ', token_type: 'bearer' });
+      }
+      if (p.get('grant_type') === 'refresh_token') {
+        if (!m.refresh.get(p.get('refresh_token'))) return json(400, { error: 'invalid_grant', error_description: 'refresh token is invalid or revoked' });
+        const at = 'at' + Math.random(); m.tokens.add(at);
+        return json(200, { access_token: at, expires_in: 14400, token_type: 'bearer' });
+      }
+      return json(400, { error: 'unsupported_grant_type' });
+    }
+    const tok = String(h.Authorization || '').replace('Bearer ', '');
+    if (!m.tokens.has(tok)) return err(401, 'expired_access_token/');
+    const ns = nsOf(h);
+    if (ns === 'bad') return err(400, 'invalid_root');
+    if (ep === 'auth/token/revoke') { m.tokens.delete(tok); m.refresh.clear(); m.revoked.add(tok); return new Response('null', { status: 200 }); }
+    if (ep === 'users/get_current_account') return json(200, { account_id: 'dbid:TJ', root_info: { '.tag': 'team', root_namespace_id: '4242', home_namespace_id: '1111' } });
+    if (ep === 'files/get_metadata') {
+      const { path } = JSON.parse(init.body);
+      if (m.folders[ns].has(path.toLowerCase())) return json(200, { '.tag': 'folder', path_display: path });
+      const f = m.get(ns, path);
+      return f ? json(200, { '.tag': 'file', rev: f.rev, path_display: f.path }) : err(409, 'path/not_found/..');
+    }
+    const arg = JSON.parse(h['Dropbox-API-Arg']);
+    if (/[^\x00-\x7e]/.test(h['Dropbox-API-Arg'])) return err(400, 'non-ASCII header');
+    if (ep === 'files/download') {
+      const f = m.get(ns, arg.path);
+      if (!f) return err(409, 'path/not_found/');
+      return new Response(f.text, { status: 200, headers: { 'Dropbox-API-Result': JSON.stringify({ rev: f.rev, path_display: f.path }) } });
+    }
+    if (ep === 'files/upload') {
+      if (m.beforeUpload) { const hook = m.beforeUpload; m.beforeUpload = null; await hook(arg.path, ns); }
+      const cur = m.get(ns, arg.path);
+      const mode = arg.mode;
+      if (mode['.tag'] === 'add' && cur) return err(409, 'path/conflict/file/');
+      if (mode['.tag'] === 'update' && (!cur || cur.rev !== mode.update)) return err(409, 'path/conflict/file/');
+      const rev = m.put(ns, arg.path, init.body);
+      return json(200, { rev, path_display: arg.path });
+    }
+    return err(400, 'unknown endpoint ' + ep);
+  };
+  return m;
+}
+
+// ------------------------------------------------------------ simulated device
+function memStorage() { const d = {}; return { getItem: k => (k in d ? d[k] : null), setItem: (k, v) => { d[k] = String(v); }, removeItem: k => { delete d[k]; }, _d: d }; }
+function device(name, mock, initial, extra) {
+  const dev = { name, S: normalize(clone(initial || freshState())), storage: memStorage(), statuses: [], blocked: false, watchAdds: 0 };
+  dev.engine = LiftDropbox.create(Object.assign({
+    appKey: 'testkey', storage: dev.storage, storageKey: 'liftstudio.dropbox',
+    fetch: (...a) => mock.fetch(...a),
+    redirectUri: () => 'http://localhost:8781/',
+    openUrl: url => { dev.openedUrl = url; },
+    getState: () => dev.S,
+    applyState: merged => { dev.S = merged; },
+    normalize,
+    merge: (a, b) => LiftMerge.mergeStates(a, b, { seed: SEED_PROGRAM }),
+    canSync: () => !dev.blocked,
+    importWatch: text => { // stand-in for app.js parseWatchFile + mergeWatchEntries (same id + tombstone rules)
+      let added = 0;
+      const dead = new Set(dev.S.tombstones.cardio.map(t => t.id));
+      text.split(/\r?\n/).forEach(line => {
+        const [date, kind, mins] = line.split(',');
+        if (!date || !mins) return;
+        const wkey = `${date}|${kind}|${+mins}`, id = watchCardioId(wkey);
+        if (dev.S.cardio.some(c => c.id === id) || dead.has(id)) return;
+        dev.S.cardio.push({ id, updatedAt: dateStamp(date), date, kind, minutes: +mins, distance: '', note: '', source: 'watch', hr: null, cal: null, wkey });
+        added++;
+      });
+      dev.watchAdds += added;
+      return added;
+    },
+    onStatus: s => dev.statuses.push(s.state),
+    log: () => {},
+  }, extra || {}));
+  dev.signIn = async () => {
+    await dev.engine.authUrl('code'); dev.engine.markCodeOpened();
+    return dev.engine.completeCode('GOODCODE');
+  };
+  dev.edit = fn => { fn(dev.S); };
+  return dev;
+}
+const sess = (id, date, day, updatedAt, reps = 8) => ({ id, day, date, minutes: 45, updatedAt, entries: { bench: { target: 135, sets: [{ reps, weight: 135, effort: 'solid', note: '', t: Date.parse(date + 'T18:00:00Z') }] } } });
+const DATA = '/TJ/Fitness/Lift Studio/lift-studio-data.json';
+const cloudState = (mock, ns = 'home', prefix = '') => { const f = mock.get(ns, prefix + DATA); return f ? normalize(JSON.parse(f.text)) : null; };
+
+// ------------------------------------------------------------ cases
+const cases = [];
+const test = (name, fn) => cases.push({ name, fn });
+function assert(c, msg) { if (!c) throw new Error(msg || 'assertion failed'); }
+const uploads = mock => mock.calls.filter(c => c.ep === 'files/upload');
+
+test('authorize URL (redirect flow): all PKCE params + redirect_uri + state', async () => {
+  const d = device('A', mockDropbox());
+  const url = new URL(await d.engine.beginRedirect());
+  assert(d.openedUrl === url.href, 'opened');
+  const p = url.searchParams;
+  assert(url.origin + url.pathname === 'https://www.dropbox.com/oauth2/authorize', url.pathname);
+  assert(p.get('client_id') === 'testkey' && p.get('response_type') === 'code', 'client_id/response_type');
+  assert(/^[A-Za-z0-9_-]{43}$/.test(p.get('code_challenge')), 'S256 challenge is 43 b64url chars');
+  assert(p.get('code_challenge_method') === 'S256' && p.get('token_access_type') === 'offline');
+  assert(p.get('redirect_uri') === 'http://localhost:8781/' && p.get('state'), 'redirect_uri + state');
+  // the challenge really is SHA-256(verifier)
+  const v = d.engine._store().pending.verifier;
+  const dig = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(v)));
+  const b64 = btoa(String.fromCharCode(...dig)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  assert(b64 === p.get('code_challenge'), 'challenge matches verifier');
+});
+
+test('authorize URL (code flow): no redirect_uri, verifier reused across reloads', async () => {
+  const d = device('A', mockDropbox());
+  const u1 = new URL(await d.engine.authUrl('code'));
+  assert(!u1.searchParams.has('redirect_uri') && !u1.searchParams.has('state'), 'no redirect_uri/state');
+  assert(u1.searchParams.get('token_access_type') === 'offline' && u1.searchParams.get('code_challenge_method') === 'S256');
+  const u2 = new URL(await d.engine.authUrl('code'));
+  assert(u1.href === u2.href, 'same pending verifier');
+});
+
+test('redirect return: code exchanged with redirect_uri, URL cleaned, bad state rejected', async () => {
+  const mock = mockDropbox();
+  const d = device('A', mock);
+  const url = new URL(await d.engine.beginRedirect());
+  const bad = await d.engine.handleRedirect('http://localhost:8781/?code=GOODCODE&state=nope');
+  assert(bad.handled && !bad.ok, 'bad state rejected');
+  await d.engine.beginRedirect();
+  const st = d.engine._store().pending.state;
+  const r = await d.engine.handleRedirect('http://localhost:8781/?code=GOODCODE&state=' + st + '#x');
+  assert(r.ok && r.cleanUrl === '/#x', JSON.stringify(r));
+  const tokCall = mock.calls.filter(c => c.ep === 'oauth2/token').pop();
+  const p = new URLSearchParams(tokCall.body);
+  assert(p.get('redirect_uri') === 'http://localhost:8781/' && p.get('code_verifier') && !p.get('client_secret'));
+  assert(d.engine.signedIn());
+  const none = await d.engine.handleRedirect('http://localhost:8781/');
+  assert(!none.handled);
+});
+
+test('code flow: wrong code fails cleanly, right code signs in (no redirect_uri sent)', async () => {
+  const mock = mockDropbox();
+  const d = device('A', mock);
+  await d.engine.authUrl('code'); d.engine.markCodeOpened();
+  assert(d.engine.getStatus().pendingCode, 'paste box state persists');
+  let threw = false;
+  try { await d.engine.completeCode('WRONG'); } catch (e) { threw = true; }
+  assert(threw && !d.engine.signedIn(), 'wrong code rejected');
+  await d.engine.completeCode('GOODCODE');
+  const p = new URLSearchParams(mock.calls.filter(c => c.ep === 'oauth2/token').pop().body);
+  assert(!p.has('redirect_uri') && d.engine.signedIn() && !d.engine.getStatus().pendingCode);
+});
+
+test('first sync on first device: creates the file (mode add), local unchanged', async () => {
+  const mock = mockDropbox();
+  const a = device('A', mock, Object.assign(freshState(), { sessions: [sess('a1', '2026-09-01', 'push', 100)] }));
+  await a.signIn();
+  const up = uploads(mock);
+  assert(up.length === 1 && JSON.parse(up[0].h['Dropbox-API-Arg']).mode['.tag'] === 'add', 'one add upload');
+  assert(cloudState(mock).sessions.length === 1);
+  assert(a.engine.getStatus().state === 'synced', a.engine.getStatus().state);
+});
+
+test('two devices with different history: first sync merges both ways, nothing lost', async () => {
+  const mock = mockDropbox();
+  const phone = device('phone', mock, Object.assign(freshState(), { sessions: [sess('p1', '2026-09-01', 'push', 0), sess('p2', '2026-09-03', 'pull', 0)] }));
+  phone.S.exercises.find(e => e.id === 'bench').weight = 140;
+  phone.S.events.push({ id: 'ev1', updatedAt: 0, date: '2026-09-01', exId: 'bench', kind: 'up', from: 135, to: 140 });
+  phone.S = normalize(phone.S);
+  const pc = device('pc', mock, Object.assign(freshState(), { sessions: [sess('d1', '2026-08-28', 'legs', 0)], cardio: [{ date: '2026-08-29', kind: 'Row', minutes: 20 }] }));
+  pc.S.settings.restDefault = 75;
+  await pc.signIn();     // cloud := PC
+  await phone.signIn();  // phone merges PC's cloud copy + its own, uploads union
+  await pc.engine.syncNow('interval'); // PC pulls
+  const cloud = cloudState(mock);
+  assert(cloud.sessions.map(s => s.id).join() === 'd1,p1,p2', cloud.sessions.map(s => s.id).join());
+  assert(C(phone.S) === C(pc.S), 'devices converged');
+  assert(C(normalize(clone(phone.S))) === C(cloud), 'cloud == devices');
+  assert(pc.S.exercises.find(e => e.id === 'bench').weight === 140, 'phone progression reached PC');
+  assert(phone.S.settings.restDefault === 75, 'PC setting reached phone');
+  assert(phone.S.cardio.length === 1);
+  // steady state: another pass does not upload again
+  const n = uploads(mock).length;
+  await phone.engine.syncNow('interval'); await pc.engine.syncNow('interval');
+  assert(uploads(mock).length === n, 'no ping-pong uploads');
+});
+
+test('409 conflict: another device writes between download and upload -> re-merge + retry', async () => {
+  const mock = mockDropbox();
+  const a = device('A', mock), b = device('B', mock);
+  await a.signIn(); await b.signIn();
+  a.edit(S => S.sessions.push(sess('fromA', '2026-09-10', 'push', Date.now())));
+  b.edit(S => S.sessions.push(sess('fromB', '2026-09-10', 'legs', Date.now())));
+  mock.beforeUpload = async () => { await b.engine.syncNow('race'); }; // B slips in first
+  const r = await a.engine.syncNow('save');
+  assert(r === 'pushed', r);
+  const ids = cloudState(mock).sessions.map(s => s.id).sort().join();
+  assert(ids === 'fromA,fromB', ids);
+  const confl = mock.calls.filter(c => c.ep === 'files/upload').length;
+  assert(confl >= 3, 'A uploaded twice (one 409) + B once');
+  await b.engine.syncNow('interval');
+  assert(C(a.S) === C(b.S));
+});
+
+test('conflict retries are capped (max 3) and end as an error, not a loop', async () => {
+  const mock = mockDropbox();
+  const a = device('A', mock);
+  await a.signIn();
+  a.edit(S => S.sessions.push(sess('x', '2026-09-11', 'push', Date.now())));
+  let races = 0;
+  const race = async () => { races++; mock.put('home', DATA, mock.get('home', DATA).text); mock.beforeUpload = race; };
+  mock.beforeUpload = race;
+  const r = await a.engine.syncNow('save');
+  mock.beforeUpload = null;
+  assert(r === 'error:conflict' && races === 4, r + ' races=' + races);
+  assert(a.S.sessions.some(s => s.id === 'x'), 'local data intact');
+  assert(await a.engine.syncNow('retry') === 'pushed');
+});
+
+test('offline -> online: silent offline status, data kept, pushed when back', async () => {
+  const mock = mockDropbox();
+  const a = device('A', mock);
+  await a.signIn();
+  mock.offline = true;
+  a.edit(S => S.cardio.push({ id: 'c-off', updatedAt: Date.now(), date: '2026-09-12', kind: 'Run', minutes: 25, distance: '', note: '' }));
+  const r = await a.engine.syncNow('save');
+  assert(r === 'error:network' && a.engine.getStatus().state === 'offline', r + ' ' + a.engine.getStatus().state);
+  mock.offline = false;
+  assert(await a.engine.syncNow('online') === 'pushed');
+  assert(cloudState(mock).cardio.some(c => c.id === 'c-off'));
+  assert(a.engine.getStatus().state === 'synced');
+});
+
+test('delete propagates: tombstone on A removes the session on B', async () => {
+  const mock = mockDropbox();
+  const a = device('A', mock, Object.assign(freshState(), { sessions: [sess('s1', '2026-09-01', 'push', 100)] }));
+  const b = device('B', mock);
+  await a.signIn(); await b.signIn();
+  assert(b.S.sessions.length === 1);
+  a.edit(S => { S.sessions = []; S.tombstones.sessions.push({ id: 's1', deleted: true, updatedAt: Date.now() }); });
+  await a.engine.syncNow('save'); await b.engine.syncNow('interval');
+  assert(b.S.sessions.length === 0 && b.S.tombstones.sessions.length === 1);
+});
+
+test('watch CSV auto-import: imports once per rev, missing file is fine, deletes stick', async () => {
+  const mock = mockDropbox();
+  const a = device('A', mock);
+  await a.signIn();
+  assert(a.engine.getStatus().state === 'synced', 'no CSV -> still synced');
+  mock.put('home', '/TJ/Fitness/watch-workouts.csv', '2026-09-20,Basketball,62\n2026-09-21,Rowing,15\n');
+  await a.engine.syncNow('interval');
+  assert(a.watchAdds === 2 && a.S.cardio.length === 2, 'imported 2');
+  assert(cloudState(mock).cardio.length === 2, 'and uploaded in the same pass');
+  const downloads = () => mock.calls.filter(c => c.ep === 'files/download' && /watch/.test(c.h['Dropbox-API-Arg'])).length;
+  const n = downloads();
+  await a.engine.syncNow('interval');
+  assert(downloads() === n, 'same rev -> not downloaded again');
+  // delete one, then the shortcut rewrites the file (new rev, same rows)
+  const gone = a.S.cardio[0].id;
+  a.edit(S => { S.cardio = S.cardio.filter(c => c.id !== gone); S.tombstones.cardio.push({ id: gone, deleted: true, updatedAt: Date.now() }); });
+  mock.put('home', '/TJ/Fitness/watch-workouts.csv', '2026-09-20,Basketball,62\n2026-09-21,Rowing,15\n2026-09-22,Rowing,20\n');
+  await a.engine.syncNow('interval');
+  assert(a.S.cardio.length === 2 && !a.S.cardio.some(c => c.id === gone), 'deleted row not re-imported, new row imported');
+  // a second device importing the same file produces the same ids: no duplicates
+  const b = device('B', mock);
+  await b.signIn();
+  assert(C(a.S) === C(b.S), 'B converged');
+});
+
+test('Business team path fallback: /TJ/Fitness missing at home -> team root + "/TJ Mitchell", cached', async () => {
+  const mock = mockDropbox({ homeFolders: [], rootFolders: ['/tj mitchell/tj/fitness'] });
+  const a = device('A', mock);
+  await a.signIn();
+  assert(a.engine._store().pathMode === 'root' && a.engine._store().rootNs === '4242', JSON.stringify(a.engine._store()));
+  assert(mock.get('root', '/TJ Mitchell' + DATA), 'file written in team root');
+  const up = uploads(mock)[0];
+  assert(JSON.parse(up.h['Dropbox-API-Path-Root']).root === '4242', 'path-root header');
+  const probes = mock.calls.filter(c => c.ep === 'users/get_current_account').length;
+  await a.engine.syncNow('interval');
+  assert(mock.calls.filter(c => c.ep === 'users/get_current_account').length === probes, 'cached, no re-probe');
+});
+
+test('folder missing everywhere: clear error, nothing uploaded', async () => {
+  const mock = mockDropbox({ homeFolders: [], rootFolders: [] });
+  const a = device('A', mock);
+  await a.signIn();
+  assert(a.engine.getStatus().state === 'error' && /Fitness/.test(a.engine.getStatus().lastError));
+  assert(uploads(mock).length === 0);
+});
+
+test('non-ASCII in Dropbox-API-Arg is \\u-escaped', async () => {
+  const s = LiftDropbox.headerJson({ path: '/TJ/Fitness/Café ✓.json' });
+  assert(/^[\x20-\x7e]*$/.test(s) && JSON.parse(s).path === '/TJ/Fitness/Café ✓.json', s);
+  const mock = mockDropbox();
+  const a = device('A', mock, null, { dataPath: '/TJ/Fitness/Lift Studio/données.json' });
+  await a.signIn();
+  assert(a.engine.getStatus().state === 'synced', a.engine.getStatus().lastError);
+});
+
+test('corrupt cloud file is never overwritten', async () => {
+  const mock = mockDropbox();
+  mock.put('home', DATA, '{ this is not json');
+  const a = device('A', mock);
+  await a.signIn();
+  assert(a.engine.getStatus().state === 'error' && uploads(mock).length === 0);
+  assert(mock.get('home', DATA).text === '{ this is not json');
+});
+
+test('local data blocked (unreadable): never uploads', async () => {
+  const mock = mockDropbox();
+  const a = device('A', mock);
+  a.blocked = true;
+  await a.signIn();
+  assert(uploads(mock).length === 0 && a.engine.getStatus().state === 'error');
+});
+
+test('expired access token: refreshed transparently', async () => {
+  const mock = mockDropbox();
+  const a = device('A', mock);
+  await a.signIn();
+  mock.expireAll();
+  a.edit(S => S.sessions.push(sess('late', '2026-09-13', 'push', Date.now())));
+  assert(await a.engine.syncNow('save') === 'pushed');
+  assert(mock.calls.some(c => c.ep === 'oauth2/token' && /refresh_token/.test(c.body)));
+});
+
+test('revoked refresh token: "reauth" state, local data untouched', async () => {
+  const mock = mockDropbox();
+  const a = device('A', mock, Object.assign(freshState(), { sessions: [sess('k', '2026-09-01', 'push', 1)] }));
+  await a.signIn();
+  mock.expireAll(); mock.refresh.clear();
+  await a.engine.syncNow('interval');
+  assert(a.engine.getStatus().state === 'reauth' && !a.engine.signedIn(), a.engine.getStatus().state);
+  assert(a.S.sessions.length === 1);
+});
+
+test('sign out: token revoked, engine storage cleared, local data kept', async () => {
+  const mock = mockDropbox();
+  const a = device('A', mock, Object.assign(freshState(), { sessions: [sess('k', '2026-09-01', 'push', 1)] }));
+  await a.signIn();
+  await a.engine.signOut();
+  assert(mock.calls.some(c => c.ep === 'auth/token/revoke'), 'revoked');
+  assert(!a.engine.signedIn() && a.storage.getItem('liftstudio.dropbox') === '{}');
+  assert(a.S.sessions.length === 1);
+  assert(await a.engine.syncNow('interval') === 'skipped');
+});
+
+test('no app key: engine reports unconfigured and never calls the network', async () => {
+  const mock = mockDropbox();
+  const d = device('X', mock, null, { appKey: '' });
+  assert(d.engine.getStatus().state === 'unconfigured' && !d.engine.signedIn());
+  assert(await d.engine.syncNow('load') === 'skipped' && mock.calls.length === 0);
+});
+
+// ------------------------------------------------------------ run (sequential, async)
+(async () => {
+  const rows = []; let pass = 0;
+  for (const c of cases) {
+    let ok = true, err = '';
+    try { await c.fn(); } catch (e) { ok = false; err = e.message; console.error(c.name, e); }
+    if (ok) pass++;
+    rows.push(`<tr><td class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</td><td>${c.name}${err ? `<br><code>${err.replace(/</g, '&lt;')}</code>` : ''}</td></tr>`);
+    document.getElementById('results').innerHTML = rows.join('');
+  }
+  const sum = document.getElementById('summary');
+  sum.textContent = `${pass}/${cases.length} passed`;
+  sum.className = pass === cases.length ? 'pass' : 'fail';
+  window.__syncResults = { pass, total: cases.length };
+})();
+</script>
+</body>
+</html>

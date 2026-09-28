@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lift Studio — merge tests</title>
+<style>
+  body { font: 14px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; background: #0e1116; color: #e8ecf2; margin: 16px; }
+  h1 { font-size: 1.1rem; }
+  #summary { font-weight: 800; margin: 8px 0 14px; }
+  table { border-collapse: collapse; width: 100%; }
+  td { border-bottom: 1px solid #2a3342; padding: 6px 8px; vertical-align: top; }
+  .pass { color: #4cc38a; font-weight: 700; } .fail { color: #e5645f; font-weight: 700; }
+  code { color: #97a3b4; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+</style>
+</head>
+<body>
+<h1>Lift Studio — sync merge tests</h1>
+<div id="summary">running…</div>
+<table id="results"></table>
+
+<script src="../program.js"></script>
+<script src="../sync-merge.js"></script>
+<script src="../state.js"></script>
+<script>
+'use strict';
+const C = LiftMerge.canonical;
+const merge = (a, b) => LiftMerge.mergeStates(a, b, { seed: SEED_PROGRAM });
+const clone = v => JSON.parse(JSON.stringify(v));
+const N = raw => normalize(clone(raw)); // what load()/sync do to any stored or downloaded copy
+
+// ---------- fixtures
+function sess(id, date, day, updatedAt, reps = 8, t = 0) {
+  const s = { id, day, date, minutes: 50, entries: { bench: { target: 135, sets: [{ reps, weight: 135, effort: 'solid', note: '', t: t || Date.parse(date + 'T18:00:00Z') }] } } };
+  if (updatedAt != null) s.updatedAt = updatedAt;
+  return s;
+}
+function state(extra) { return Object.assign(freshState(), extra || {}); }
+function cardio(date, kind, minutes, extra) { return Object.assign({ date, kind, minutes, distance: '', note: '' }, extra || {}); }
+
+const cases = [];
+const test = (name, fn) => cases.push({ name, fn });
+function assert(cond, msg) { if (!cond) throw new Error(msg || 'assertion failed'); }
+function eqJ(a, b, msg) { if (C(a) !== C(b)) throw new Error((msg || 'not equal') + '\n  got:  ' + C(a).slice(0, 400) + '\n  want: ' + C(b).slice(0, 400)); }
+const ids = arr => arr.map(x => x.id).sort();
+
+// ---------- cases
+test('disjoint devices: union of sessions, cardio, events', () => {
+  const phone = N(state({ sessions: [sess('s1', '2026-09-01', 'push', 100), sess('s2', '2026-09-03', 'pull', 200)],
+    cardio: [cardio('2026-09-02', 'Hoops', 60, { id: 'c1', updatedAt: 5 })] }));
+  const pc = N(state({ sessions: [sess('s3', '2026-09-02', 'legs', 150)], cardio: [cardio('2026-09-04', 'Row', 15, { id: 'c2', updatedAt: 6 })],
+    events: [{ id: 'e1', updatedAt: 7, date: '2026-09-02', exId: 'squat', kind: 'up', from: 135, to: 140 }] }));
+  const m = merge(phone, pc);
+  eqJ(m.sessions.map(s => s.id), ['s1', 's3', 's2'], 'sessions in date order');
+  eqJ(ids(m.cardio), ['c1', 'c2']);
+  eqJ(ids(m.events), ['e1']);
+});
+
+test('same session edited on both: higher updatedAt wins', () => {
+  const a = N(state({ sessions: [sess('s1', '2026-09-01', 'push', 100, 8)] }));
+  const b = N(state({ sessions: [sess('s1', '2026-09-01', 'push', 200, 10)] }));
+  const m = merge(a, b);
+  assert(m.sessions.length === 1, 'one session');
+  assert(m.sessions[0].entries.bench.sets[0].reps === 10, 'newer edit kept');
+  assert(merge(b, a).sessions[0].entries.bench.sets[0].reps === 10, 'order independent');
+});
+
+test('same updatedAt, different content: deterministic winner both ways', () => {
+  const a = N(state({ sessions: [sess('s1', '2026-09-01', 'push', 100, 8)] }));
+  const b = N(state({ sessions: [sess('s1', '2026-09-01', 'push', 100, 9)] }));
+  eqJ(merge(a, b), merge(b, a));
+});
+
+test('delete vs older edit: delete wins and propagates', () => {
+  const a = N(state({ sessions: [], tombstones: { sessions: [{ id: 's1', deleted: true, updatedAt: 300 }] } }));
+  const b = N(state({ sessions: [sess('s1', '2026-09-01', 'push', 200)] }));
+  const m = merge(a, b);
+  assert(m.sessions.length === 0, 'session gone');
+  eqJ(m.tombstones.sessions, [{ id: 's1', deleted: true, updatedAt: 300 }]);
+  assert(merge(b, a).sessions.length === 0, 'order independent');
+});
+
+test('edit newer than delete: record comes back', () => {
+  const a = N(state({ tombstones: { sessions: [{ id: 's1', deleted: true, updatedAt: 300 }] } }));
+  const b = N(state({ sessions: [sess('s1', '2026-09-01', 'push', 400)] }));
+  const m = merge(a, b);
+  assert(m.sessions.length === 1 && m.tombstones.sessions.length === 0);
+});
+
+test('delete vs edit at the same ms: delete wins', () => {
+  const a = N(state({ tombstones: { cardio: [{ id: 'c1', deleted: true, updatedAt: 500 }] } }));
+  const b = N(state({ cardio: [cardio('2026-09-01', 'Run', 20, { id: 'c1', updatedAt: 500 })] }));
+  assert(merge(a, b).cardio.length === 0 && merge(b, a).cardio.length === 0);
+});
+
+test('delete of an old record (no updatedAt) wins over the untouched copy', () => {
+  const old = N(state({ sessions: [sess('s1', '2026-08-01', 'push', null)] }));
+  const other = clone(old);
+  other.sessions = []; other.tombstones.sessions.push({ id: 's1', deleted: true, updatedAt: Date.now() });
+  assert(merge(old, other).sessions.length === 0);
+});
+
+test('old data without ids/timestamps: same records on two devices do not duplicate', () => {
+  const raw = { settings: {}, exercises: [], days: [],
+    sessions: [{ day: 'push', date: '2026-08-30', entries: { bench: { target: 135, sets: [{ reps: 8, weight: 135, effort: 'solid' }] } } }],
+    cardio: [cardio('2026-08-31', 'Walk', 30), cardio('2026-08-31', 'Walk', 30), cardio('2026-09-01', 'Hoops', 90)],
+    events: [{ date: '2026-08-30', exId: 'bench', kind: 'up', from: 135, to: 140 }] };
+  const phone = N(raw), pc = N(raw);
+  eqJ(phone.sessions[0].id, pc.sessions[0].id, 'session id deterministic');
+  const m = merge(phone, pc);
+  assert(m.sessions.length === 1, 'one session');
+  assert(m.cardio.length === 3, 'two identical walks stay two, hoops one: got ' + m.cardio.length);
+  assert(m.events.length === 1, 'one event');
+  assert(m.cardio.every(c => c.updatedAt === 0), 'missing updatedAt -> 0');
+});
+
+test('old watch entries get the same id as a fresh watch import', () => {
+  const wkey = '2026-09-01|Hoops|62';
+  const n = N(state({ cardio: [cardio('2026-09-01', 'Hoops', 62, { source: 'watch', wkey })] }));
+  assert(n.cardio[0].id === watchCardioId(wkey));
+});
+
+test('old-format data (v1: null set holes, no schemaVersion) still loads, nothing dropped', () => {
+  const raw = { settings: { barWeight: '45' }, exercises: [{ id: 'bench', name: 'Barbell Bench Press', weight: '145', sets: 4, repLow: 6, repHigh: 8 }],
+    sessions: [{ id: 'sX', day: 'push', date: '2026-08-29', entries: { bench: { target: '145', sets: [{ reps: 8, weight: 145, effort: 'solid' }, null, { reps: 7, weight: 145 }] } } }],
+    cardio: [{ date: '2026-08-29', kind: 'Row', minutes: '15' }], active: null };
+  const n = N(raw);
+  assert(n.schemaVersion === SCHEMA_VERSION);
+  assert(n.sessions[0].entries.bench.sets.length === 2, 'null hole repaired');
+  assert(n.exercises.find(e => e.id === 'bench').weight === 145);
+  assert(n.exercises.length === SEED_PROGRAM.exercises.length, 'seed exercises merged forward');
+  assert(n.cardio[0].minutes === 15 && n.cardio[0].id);
+  eqJ(N(n), n, 'normalize is idempotent');
+});
+
+test('settings: bar weight changed on phone + rest changed on PC -> both survive', () => {
+  const phone = N(state()), pc = N(state());
+  phone.settings.barWeight = 35; phone.settingsTs.barWeight = 1000;
+  pc.settings.restDefault = 120; pc.settingsTs.restDefault = 2000;
+  const m = merge(phone, pc);
+  assert(m.settings.barWeight === 35 && m.settings.restDefault === 120, C(m.settings));
+  eqJ(m, merge(pc, phone));
+});
+
+test('settings: same field on both -> newer wins', () => {
+  const a = N(state()), b = N(state());
+  a.settings.restCompound = 180; a.settingsTs.restCompound = 5000;
+  b.settings.restCompound = 120; b.settingsTs.restCompound = 6000;
+  assert(merge(a, b).settings.restCompound === 120);
+});
+
+test('settings changed before sync existed (ts 0) beat the seed default on the other device', () => {
+  const a = N(state()), b = N(state());
+  a.settings.platePairs = [45, 35, 25, 10, 5, 2.5];
+  const m = merge(a, b);
+  eqJ(m.settings.platePairs, [45, 35, 25, 10, 5, 2.5]);
+  eqJ(merge(b, a).settings.platePairs, [45, 35, 25, 10, 5, 2.5]);
+});
+
+test('exercise targets: bench weight on phone + bench reps on PC -> both survive', () => {
+  const phone = N(state()), pc = N(state());
+  const pb = phone.exercises.find(e => e.id === 'bench'), cb = pc.exercises.find(e => e.id === 'bench');
+  pb.weight = 145; pb.fieldTs.weight = 1000;
+  cb.repHigh = 10; cb.fieldTs.repHigh = 2000;
+  const m = merge(phone, pc).exercises.find(e => e.id === 'bench');
+  assert(m.weight === 145 && m.repHigh === 10, C(m));
+});
+
+test('pre-sync progression (dated by its event) beats an untouched seed weight', () => {
+  const phone = state();
+  phone.exercises.find(e => e.id === 'bench').weight = 140;
+  phone.events = [{ date: '2026-09-05', exId: 'bench', kind: 'up', from: 135, to: 140 }];
+  const pc = state();
+  const m = merge(N(phone), N(pc));
+  assert(m.exercises.find(e => e.id === 'bench').weight === 140);
+  assert(merge(N(pc), N(phone)).exercises.find(e => e.id === 'bench').weight === 140);
+});
+
+test('TBD weight adopted on one device (no event) still beats null', () => {
+  const a = state(); a.exercises.find(e => e.id === 'rdl').weight = 95;
+  const m = merge(N(a), N(state()));
+  assert(m.exercises.find(e => e.id === 'rdl').weight === 95);
+});
+
+test('seeded program + days identical on both: no duplicates, no churn', () => {
+  const a = N(state()), b = N(state());
+  const m = merge(a, b);
+  assert(m.days.length === SEED_PROGRAM.days.length, 'days');
+  assert(m.exercises.length === SEED_PROGRAM.exercises.length, 'exercises');
+  eqJ(m.days.map(d => d.id), SEED_PROGRAM.days.map(d => d.id), 'seed order');
+  eqJ(merge(m, m), m, 'idempotent');
+});
+
+test('bonus exercise created on one device appears on the other', () => {
+  const a = N(state()), b = N(state());
+  a.exercises.push({ id: 'bx-pull-ups', day: null, bonus: true, name: 'Pull-ups', type: 'bodyweight', loadLabel: 'body', sets: 3, repLow: 1, repHigh: 99, weight: 0, increment: 0, fieldTs: { name: 10 }, updatedAt: 10 });
+  const m = merge(a, b);
+  assert(m.exercises.some(e => e.id === 'bx-pull-ups'));
+});
+
+test('active workout: newer in-flight workout wins', () => {
+  const a = N(state({ active: { id: 'w1', day: 'push', date: '2026-09-10', startedAt: 1, entries: {} }, activeUpdatedAt: 100 }));
+  const b = N(state({ active: { id: 'w2', day: 'pull', date: '2026-09-10', startedAt: 2, entries: {} }, activeUpdatedAt: 200 }));
+  assert(merge(a, b).active.id === 'w2' && merge(b, a).active.id === 'w2');
+});
+
+test('active workout finished on another device is dropped (not resurrected)', () => {
+  const a = N(state({ active: { id: 'w1', day: 'push', date: '2026-09-10', startedAt: 1, entries: {} }, activeUpdatedAt: 500 }));
+  const b = N(state({ sessions: [sess('w1', '2026-09-10', 'push', 400)], active: null, activeUpdatedAt: 400 }));
+  const m = merge(a, b);
+  assert(m.active === null, 'dropped');
+  assert(m.sessions.length === 1);
+});
+
+test('active discarded on phone (null, newer) beats stale copy on PC', () => {
+  const a = N(state({ active: null, activeUpdatedAt: 900 }));
+  const b = N(state({ active: { id: 'w1', day: 'push', date: '2026-09-10', startedAt: 1, entries: {} }, activeUpdatedAt: 800 }));
+  assert(merge(a, b).active === null && merge(b, a).active === null);
+});
+
+test('FIRST SYNC: phone with history + PC with different history -> nothing lost', () => {
+  const phone = state({
+    sessions: [sess('p1', '2026-09-01', 'push', null), sess('p2', '2026-09-03', 'pull', null)],
+    cardio: [cardio('2026-09-02', 'Hoops', 75, { source: 'watch', wkey: '2026-09-02|Hoops|75' })],
+    events: [{ date: '2026-09-01', exId: 'bench', kind: 'up', from: 135, to: 140 }],
+    active: { id: 'p3', day: 'legs', date: '2026-09-05', startedAt: Date.parse('2026-09-05T17:00:00Z'), entries: { squat: { target: 135, sets: [{ reps: 8, weight: 135, effort: 'solid', t: Date.parse('2026-09-05T17:05:00Z') }] } } },
+  });
+  phone.exercises.find(e => e.id === 'bench').weight = 140;
+  const pc = state({ sessions: [sess('d1', '2026-08-28', 'legs', null)], cardio: [cardio('2026-08-29', 'Row', 20)] });
+  pc.settings.restDefault = 75;
+  const cloud = merge(N(pc), N(pc)); // PC synced first: the cloud file == PC's data
+  const onPhone = merge(N(phone), cloud); // phone's first sync
+  eqJ(onPhone.sessions.map(s => s.id), ['d1', 'p1', 'p2']);
+  assert(onPhone.cardio.length === 2, 'cardio union');
+  assert(onPhone.events.length === 1, 'events');
+  assert(onPhone.exercises.find(e => e.id === 'bench').weight === 140, 'phone progression kept');
+  assert(onPhone.settings.restDefault === 75, 'PC setting kept');
+  assert(onPhone.active && onPhone.active.id === 'p3', 'in-flight workout kept');
+  // PC's next sync pulls it and converges to the identical state
+  const backOnPc = merge(N(pc), onPhone);
+  eqJ(backOnPc, onPhone, 'PC converges');
+});
+
+test('fresh device (empty) merging into cloud: takes the cloud, overwrites nothing', () => {
+  const cloud = N(state({ sessions: [sess('s1', '2026-09-01', 'push', 100)] }));
+  cloud.exercises.find(e => e.id === 'bench').weight = 150;
+  cloud.exercises.find(e => e.id === 'bench').fieldTs.weight = 1000;
+  const m = merge(N(freshState()), cloud);
+  eqJ(m, merge(cloud, cloud));
+});
+
+test('commutative + idempotent + associative on a mixed scenario', () => {
+  const a = N(state({ sessions: [sess('s1', '2026-09-01', 'push', 100), sess('s2', '2026-09-02', 'pull', 50)], cardio: [cardio('2026-09-01', 'Run', 30)] }));
+  const b = N(state({ sessions: [sess('s2', '2026-09-02', 'pull', 60, 11)], tombstones: { sessions: [{ id: 's1', deleted: true, updatedAt: 90 }] }, lastExportAt: 77 }));
+  const c = N(state({ sessions: [sess('s3', '2026-09-04', 'legs', 10)], active: { id: 'w9', day: 'push', date: '2026-09-05', startedAt: 5, entries: {} }, activeUpdatedAt: 5 }));
+  c.settings.barWeight = 35; c.settingsTs.barWeight = 42;
+  eqJ(merge(a, b), merge(b, a), 'commutative');
+  const m = merge(merge(a, b), c);
+  eqJ(m, merge(a, merge(b, c)), 'associative');
+  eqJ(merge(m, m), m, 'idempotent');
+  assert(m.sessions.find(s => s.id === 's1').updatedAt === 100, 'edit (100) newer than delete (90)');
+  assert(m.sessions.find(s => s.id === 's2').entries.bench.sets[0].reps === 11);
+  assert(m.lastExportAt === 77 && m.settings.barWeight === 35 && m.active.id === 'w9');
+});
+
+test('merge never mutates its inputs', () => {
+  const a = N(state({ sessions: [sess('s1', '2026-09-01', 'push', 100)] }));
+  const b = N(state({ tombstones: { sessions: [{ id: 's1', deleted: true, updatedAt: 300 }] } }));
+  const ca = C(a), cb = C(b);
+  merge(a, b);
+  assert(C(a) === ca && C(b) === cb);
+});
+
+test('unknown top-level keys (newer app version) are preserved', () => {
+  const a = N(state()); a.futureThing = { x: 1 };
+  const m = merge(a, N(state()));
+  eqJ(m.futureThing, { x: 1 });
+});
+
+test('merged output survives normalize unchanged (load after sync is a no-op)', () => {
+  const a = N(state({ sessions: [sess('s1', '2026-09-01', 'push', 100)], cardio: [cardio('2026-09-01', 'Run', 30)], events: [{ date: '2026-09-01', exId: 'bench', kind: 'up', from: 135, to: 140 }] }));
+  const m = merge(a, N(state()));
+  eqJ(N(m), m);
+});
+
+// ---------- run
+const rows = [];
+let pass = 0;
+cases.forEach(c => {
+  let ok = true, err = '';
+  try { c.fn(); } catch (e) { ok = false; err = e.message; console.error(c.name, e); }
+  if (ok) pass++;
+  rows.push(`<tr><td class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</td><td>${c.name}${err ? `<br><code>${err.replace(/</g, '&lt;')}</code>` : ''}</td></tr>`);
+});
+document.getElementById('results').innerHTML = rows.join('');
+const sum = document.getElementById('summary');
+sum.textContent = `${pass}/${cases.length} passed`;
+sum.className = pass === cases.length ? 'pass' : 'fail';
+window.__mergeResults = { pass, total: cases.length };
+</script>
+</body>
+</html>
