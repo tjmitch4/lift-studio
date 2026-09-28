@@ -140,6 +140,7 @@ let progressEx = null;        // selected exercise id on progress tab
 let expandedSession = null;   // session id expanded in history
 let cardioKind = null;
 let coachReportCache = null;
+let coachReportDay = null;     // the report embeds today's date + a 14-day window
 
 // ============================================================ helpers
 const $ = sel => document.querySelector(sel);
@@ -686,8 +687,17 @@ function bonusModal() {
   };
 }
 function addBonusExercise(name, type) {
-  const id = 'bx-' + name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-  let ex = exById(id);
+  // reuse a prior bonus lift with the same name + type; otherwise mint a unique id
+  // (symbol-only names slug to '', and 'DB Row' vs 'db-row!' must not merge across types)
+  let ex = S.exercises.find(e => e.bonus && e.name.toLowerCase() === name.toLowerCase() && e.type === type);
+  let id = ex ? ex.id : null;
+  if (!ex) {
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    id = 'bx-' + (slug || uid());
+    const clash = exById(id);
+    if (clash && clash.type !== type) id += '-' + type;
+    ex = exById(id); // same slug + same type (e.g. 'Pull-ups' vs 'pull ups') -> same lift
+  }
   if (!ex) {
     ex = {
       id, day: null, bonus: true, name, type,
@@ -824,7 +834,7 @@ function renderProgress() {
     const e1rm = byReps ? null : Math.max(...lastSets.map(x => x.weight * (1 + x.reps / 30)));
     const firstStat = ex.type === 'bodyweight'
       ? `<div class="stat"><div class="stat-val">${lastSets.reduce((n, x) => n + x.reps, 0)}</div><div class="stat-label">Last total reps</div></div>`
-      : `<div class="stat"><div class="stat-val">${fmtW(ex.weight)}${isTimed ? 's' : ''}</div><div class="stat-label">${isTimed ? 'Target' : 'Working lb'}</div></div>`;
+      : `<div class="stat"><div class="stat-val">${isTimed ? ex.repHigh + 's' : fmtW(ex.weight)}</div><div class="stat-label">${isTimed ? 'Target' : 'Working lb'}</div></div>`;
     html += `<div class="stat-row">
       ${firstStat}
       <div class="stat"><div class="stat-val">${fmtW(bestEver)}${isTimed ? 's' : ''}</div><div class="stat-label">Best ${isTimed ? 'hold' : byReps ? 'reps' : 'lifted'}</div></div>
@@ -852,6 +862,14 @@ function renderProgress() {
   view.querySelectorAll('[data-sess]').forEach(el => el.onclick = () => {
     expandedSession = expandedSession === el.dataset.sess ? null : el.dataset.sess; render();
   });
+  view.querySelectorAll('[data-delsess]').forEach(b => b.onclick = () => {
+    const s = S.sessions.find(x => x.id === b.dataset.delsess); if (!s) return;
+    confirmModal('Delete this workout?', `${dayName(s.day)} on ${fmtDate(s.date)} is removed from history, charts and the coach report. Weight changes you already applied stay as they are.`, () => {
+      S.sessions = S.sessions.filter(x => x !== s);
+      expandedSession = null; coachReportCache = null;
+      save(); render(); toast('Workout deleted.');
+    });
+  });
 }
 
 function histDetail(s) {
@@ -866,6 +884,7 @@ function histDetail(s) {
     html += `<div><b style="color:var(--text)">${esc(ex.name)}</b> — ${sets}${grinds ? ` <span style="color:var(--red)">(${grinds} grind${grinds > 1 ? 's' : ''})</span>` : ''}${notes ? `<br><span class="faint">“${esc(notes)}”</span>` : ''}</div>`;
   }
   if (s.bodyCheck) html += `<div style="margin-top:6px">Neck/shoulders: <b style="color:${s.bodyCheck === 'good' ? 'var(--green)' : s.bodyCheck === 'tight' ? 'var(--blue)' : 'var(--red)'}">${s.bodyCheck}</b>${s.bodyNote ? ` — “${esc(s.bodyNote)}”` : ''}</div>`;
+  html += `<div class="hist-actions"><button class="btn-ghost danger" data-delsess="${esc(s.id)}">Delete workout</button></div>`;
   return html + '</div>';
 }
 
@@ -905,9 +924,33 @@ function mapWatchKind(name) {
 function localDateOf(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
+// Safari's Date parser rejects 'yyyy-MM-dd HH:mm:ss -0400' (Health Auto Export) and treats a
+// bare 'yyyy-MM-dd' as UTC midnight (the previous day in Boston). Normalize before parsing.
+function parseDateLoose(v) {
+  if (v instanceof Date) return v;
+  if (typeof v === 'number') return new Date(v);
+  const s = String(v == null ? '' : v).trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?\s*(Z|[+-]\d{2}:?\d{2})?$/i);
+  if (!m) return new Date(s);
+  const [, y, mo, d, hh, mm, ss, tz] = m;
+  if (hh == null) return new Date(+y, +mo - 1, +d, 12); // date only -> local noon
+  const iso = `${y}-${mo}-${d}T${hh.padStart(2, '0')}:${mm}:${ss || '00'}`;
+  if (!tz) return new Date(+y, +mo - 1, +d, +hh, +mm, +(ss || 0)); // no zone -> local time
+  const zone = tz.toUpperCase() === 'Z' ? 'Z' : tz.replace(/^([+-]\d{2}):?(\d{2})$/, '$1:$2');
+  return new Date(iso + zone);
+}
 function parseWatchDuration(v) {
   if (v == null || v === '') return null;
-  const s = String(v).trim();
+  const s = String(v).trim().toLowerCase();
+  // unit words, e.g. '1 hr 5 min', '45 min', '1h 5m 30s', '2 hours'
+  const unit = re => { const m = s.match(re); return m ? parseFloat(m[1]) : 0; };
+  if (/\d\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)\b/.test(s)) {
+    const h = unit(/(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\b/);
+    const m = unit(/(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)\b/);
+    const sec = unit(/(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b/);
+    const total = Math.round(h * 60 + m + sec / 60);
+    return total > 0 ? total : null;
+  }
   if (s.includes(':')) {
     const p = s.split(':').map(Number);
     if (p.some(isNaN)) return null;
@@ -929,13 +972,14 @@ function parseWatchFile(text) {
     const ws = (j && j.data && j.data.workouts) || (j && j.workouts) || (Array.isArray(j) ? j : null);
     if (ws && Array.isArray(ws)) {
       ws.forEach(w => {
+        if (!w || typeof w !== 'object') return;
         const start = w.start || w.startDate || w.date;
         if (!start) return;
-        const d = new Date(start);
+        const d = parseDateLoose(start);
         if (isNaN(d)) return;
         let mins = parseWatchDuration(w.duration);
         const end = w.end || w.endDate;
-        if (!mins && end) mins = Math.round((new Date(end) - d) / 60000);
+        if (!mins && end) { const e = parseDateLoose(end); if (!isNaN(e)) mins = Math.round((e - d) / 60000); }
         if (!mins || mins <= 0) return;
         out.push({
           date: localDateOf(d),
@@ -952,7 +996,7 @@ function parseWatchFile(text) {
   text.split(/\r?\n/).forEach(line => {
     const parts = line.split(/[,|;\t]/).map(x => x.trim());
     if (parts.length < 3) return;
-    const d = new Date(parts[0].includes('T') ? parts[0] : parts[0].replace(' ', 'T'));
+    const d = parseDateLoose(parts[0]);
     if (isNaN(d)) return;
     const mins = parseWatchDuration(parts[2]);
     if (!mins) return;
@@ -988,7 +1032,7 @@ function mergeWatchEntries(parsed) {
 // ============================================================ cardio tab
 function renderCardio() {
   const recent = [...S.cardio].reverse().slice(0, 30);
-  const last14 = S.cardio.filter(c => daysAgo(c.date) <= 14);
+  const last14 = S.cardio.filter(c => daysAgo(c.date) < 14);
   const sports = last14.filter(c => c.kind === 'Hoops' || c.kind === 'Tennis');
   const engine = last14.filter(c => c.kind === 'Row' || c.kind === 'Run');
   let nudge;
@@ -999,13 +1043,15 @@ function renderCardio() {
 
   let html = `<div class="hero"><h2>Cardio &amp; sports</h2><div class="muted">${esc(nudge)}</div></div>
   <div class="card cardio-form">
-    <div class="kind-row">${SEED_PROGRAM.cardioKinds.map(k =>
-      `<button class="chip ${cardioKind === k ? 'active' : ''}" data-kind="${esc(k)}">${k}</button>`).join('')}</div>
+    <div class="kind-row" role="group" aria-label="Activity">${SEED_PROGRAM.cardioKinds.map(k =>
+      `<button class="chip ${cardioKind === k ? 'active' : ''}" data-kind="${esc(k)}" aria-pressed="${cardioKind === k}">${esc(k)}</button>`).join('')}</div>
     <div class="form-row">
-      <div><label>Minutes</label><input type="number" id="cMin" inputmode="numeric" placeholder="30"></div>
-      <div><label>Distance (optional)</label><input type="text" id="cDist" placeholder="e.g. 2 mi / 2000 m"></div>
+      <div><label for="cMin">Minutes</label><input type="number" id="cMin" inputmode="numeric" placeholder="30"></div>
+      <div><label for="cDate">Date</label><input type="date" id="cDate" value="${todayISO()}" max="${todayISO()}"></div>
     </div>
-    <label>Note (optional)</label>
+    <label for="cDist">Distance (optional)</label>
+    <input type="text" id="cDist" placeholder="e.g. 2 mi / 2000 m" style="margin-bottom:12px">
+    <label for="cNote">Note (optional)</label>
     <textarea id="cNote" rows="2" placeholder="How it felt, who won…"></textarea>
     <div class="btn-row" style="margin-top:12px"><button class="btn" id="cSave">Log it</button></div>
   </div>
@@ -1019,24 +1065,38 @@ function renderCardio() {
   <div class="section-title">Recent</div>`;
   if (!recent.length) html += `<div class="card muted">No entries yet.</div>`;
   recent.forEach(c => {
-    const meta = [`${c.minutes} min`];
+    const meta = [`${esc(c.minutes)} min`];
     if (c.distance) meta.push(esc(c.distance));
-    if (c.hr) meta.push(`${c.hr} bpm`);
-    if (c.cal) meta.push(`${c.cal} cal`);
-    html += `<div class="card">
+    if (c.hr) meta.push(`${esc(c.hr)} bpm`);
+    if (c.cal) meta.push(`${esc(c.cal)} cal`);
+    const idx = S.cardio.indexOf(c);
+    html += `<div class="card cardio-item">
       <div class="hist-head"><div><b>${esc(c.kind)}</b> <span class="faint">· ${fmtDate(c.date)}</span>${c.source === 'watch' ? ' <span class="pill blue">watch</span>' : ''}</div>
       <div class="faint">${meta.join(' · ')}</div></div>
       ${c.note ? `<div class="faint" style="margin-top:4px">“${esc(c.note)}”</div>` : ''}
+      <div class="hist-actions"><button class="btn-ghost" data-delcardio="${idx}" aria-label="Delete ${esc(c.kind)} on ${esc(fmtDate(c.date))}">Delete</button></div>
     </div>`;
   });
   view.innerHTML = html;
   view.querySelectorAll('[data-kind]').forEach(b => b.onclick = () => {
     cardioKind = b.dataset.kind;
-    view.querySelectorAll('[data-kind]').forEach(x => x.classList.toggle('active', x.dataset.kind === cardioKind));
+    view.querySelectorAll('[data-kind]').forEach(x => {
+      x.classList.toggle('active', x.dataset.kind === cardioKind);
+      x.setAttribute('aria-pressed', String(x.dataset.kind === cardioKind));
+    });
+  });
+  view.querySelectorAll('[data-delcardio]').forEach(b => b.onclick = () => {
+    const c = S.cardio[+b.dataset.delcardio]; if (!c) return;
+    confirmModal('Delete this entry?', `${c.kind} · ${c.minutes} min on ${fmtDate(c.date)} is removed.`, () => {
+      S.cardio = S.cardio.filter(x => x !== c);
+      coachReportCache = null;
+      save(); render(); toast('Entry deleted.');
+    });
   });
   $('#watchImport').onclick = () => $('#watchFile').click();
   $('#watchFile').onchange = ev => {
     const f = ev.target.files[0]; if (!f) return;
+    ev.target.value = ''; // allow re-picking the same file
     const r = new FileReader();
     r.onload = () => {
       const parsed = parseWatchFile(String(r.result));
@@ -1050,8 +1110,11 @@ function renderCardio() {
   $('#cSave').onclick = () => {
     const mins = parseInt($('#cMin').value, 10);
     if (!cardioKind) return toast('Pick an activity');
-    if (!mins) return toast('How many minutes?');
-    S.cardio.push({ date: todayISO(), kind: cardioKind, minutes: mins, distance: ($('#cDist').value || '').trim(), note: ($('#cNote').value || '').trim() });
+    if (!mins || mins <= 0) return toast('How many minutes?');
+    const dv = $('#cDate').value;
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(dv) && dv <= todayISO() ? dv : todayISO();
+    S.cardio.push({ date, kind: cardioKind, minutes: mins, distance: ($('#cDist').value || '').trim(), note: ($('#cNote').value || '').trim() });
+    S.cardio.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0); // stable: same-day order kept
     cardioKind = null; coachReportCache = null;
     save(); render(); toast('Logged.');
   };
@@ -1059,7 +1122,7 @@ function renderCardio() {
 
 // ============================================================ coach tab
 function coachReport() {
-  if (coachReportCache) return coachReportCache;
+  if (coachReportCache && coachReportDay === todayISO()) return coachReportCache;
   const L = [];
   L.push(`# Lift Studio — Coach Report`);
   L.push(`Generated ${todayISO()} · ${S.sessions.length} workouts logged\n`);
@@ -1106,7 +1169,7 @@ function coachReport() {
     });
   }
 
-  const c14 = S.cardio.filter(c => daysAgo(c.date) <= 14);
+  const c14 = S.cardio.filter(c => daysAgo(c.date) < 14);
   L.push(`\n## Cardio & sports (last 14 days)`);
   if (!c14.length) L.push(`- none logged`);
   else {
@@ -1138,7 +1201,7 @@ function coachReport() {
   L.push(`\n## Flags for coaching`);
   L.push(flags.length ? flags.map(f => `- ${f}`).join('\n') : `- nothing flagged`);
 
-  coachReportCache = L.join('\n');
+  coachReportCache = L.join('\n'); coachReportDay = todayISO();
   return coachReportCache;
 }
 

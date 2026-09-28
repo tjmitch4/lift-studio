@@ -311,3 +311,5 @@ button.hist-toggle { background: none; border: none; padding: 0; display: flex; 
 html, button, a, [role=button] { touch-action: manipulation; }
 .day-card .day-title { display: block; font-size: 1.05rem; font-weight: 800; }
 .day-card .day-meta { display: block; }
+.cardio-form .form-row > div { min-width: 0; }
+.cardio-form input[type=date] { -webkit-appearance: none; appearance: none; display: block; min-width: 0; }
