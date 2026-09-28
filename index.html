@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Lift Studio">
+<meta name="application-name" content="Lift Studio">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
+<title>Lift Studio</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Lift<span>Studio</span></div>
+  <div class="topbar-date" id="topbarDate"></div>
+</header>
+
+<main id="view" class="view"></main>
+
+<div id="restBar" class="rest-bar hidden">
+  <div class="rest-info">
+    <div class="rest-label">REST</div>
+    <div class="rest-time" id="restTime">1:30</div>
+  </div>
+  <div class="rest-progress"><div class="rest-progress-fill" id="restFill"></div></div>
+  <div class="rest-actions">
+    <button class="btn-ghost" id="restPlus">+30s</button>
+    <button class="btn-ghost" id="restSkip">Skip</button>
+  </div>
+</div>
+
+<nav class="tabbar">
+  <button class="tab active" data-tab="workout">
+    <svg viewBox="0 0 24 24"><path d="M6.5 6.5h1.8v11H6.5zm9.2 0h1.8v11h-1.8zM3 9.5h1.8v5H3zm16.2 0H21v5h-1.8zM8.3 11h7.4v2H8.3z"/></svg>
+    <span>Workout</span>
+  </button>
+  <button class="tab" data-tab="progress">
+    <svg viewBox="0 0 24 24"><path d="M4 19h16v2H4zM5 12l4-4 3.5 3.5L18 6l1.5 1.5-7 7L9 11l-4 4z"/></svg>
+    <span>Progress</span>
+  </button>
+  <button class="tab" data-tab="cardio">
+    <svg viewBox="0 0 24 24"><path d="M12 21s-7.5-4.9-9.5-9C1 8.5 3 5.5 6.2 5.5c1.9 0 3.4 1 4.3 2.4l1.5 2.3 1.5-2.3c.9-1.4 2.4-2.4 4.3-2.4 3.2 0 5.2 3 3.7 6.5-2 4.1-9.5 9-9.5 9z"/></svg>
+    <span>Cardio</span>
+  </button>
+  <button class="tab" data-tab="coach">
+    <svg viewBox="0 0 24 24"><path d="M12 3a7 7 0 0 0-7 7c0 2.4 1.2 4.5 3 5.7V18a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.3c1.8-1.2 3-3.3 3-5.7a7 7 0 0 0-7-7zM9.5 21.5h5" stroke-width="1.6" fill="none" stroke="currentColor" stroke-linecap="round"/></svg>
+    <span>Coach</span>
+  </button>
+</nav>
+
+<div id="modalRoot"></div>
+
+<script src="program.js"></script>
+<script src="app.js"></script>
+<script>
+  // Offline support: only register over https (GitHub Pages) or localhost.
+  if ('serviceWorker' in navigator &&
+      (location.protocol === 'https:' || ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname))) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js', { scope: './' }).catch(err => console.warn('SW registration failed', err));
+    });
+  }
+</script>
+</body>
+</html>
