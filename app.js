@@ -86,7 +86,10 @@ function normalize(st) {
   };
   st.sessions = arr(st.sessions).filter(s => s && typeof s === 'object').map(normSession);
   st.active = st.active && typeof st.active === 'object' ? normSession(st.active) : null;
-  if (st.active) st.active.startedAt = num(st.active.startedAt, Date.now());
+  if (st.active) {
+    st.active.startedAt = num(st.active.startedAt, Date.now());
+    if (st.active.restEndAt != null) st.active.restEndAt = num(st.active.restEndAt, 0);
+  }
 
   st.cardio = arr(st.cardio).filter(c => c && typeof c === 'object').map(c => ({
     ...c,
@@ -316,7 +319,7 @@ function countStreak(arr, pred) {
 }
 
 // ============================================================ rest timer
-let rest = { left: 0, total: 0, iv: null };
+let rest = { endAt: 0, left: 0, total: 0, iv: null };
 // iOS only lets audio play from a context created/resumed during a user gesture, and the
 // rest timer fires from setInterval — so create + unlock one shared context on first tap.
 let audioCtx = null;
@@ -329,24 +332,45 @@ function unlockAudio() {
 document.addEventListener('touchend', unlockAudio, { passive: true });
 document.addEventListener('click', unlockAudio);
 function startRest(seconds) {
+  runRest(Date.now() + seconds * 1000, seconds);
+}
+// Wall-clock based: iOS suspends timers while the phone is locked, so every tick (and every
+// return to the app) recomputes what's left from endAt instead of counting ticks.
+// endAt is mirrored into S.active (additive fields) so a reload or page eviction keeps it.
+function runRest(endAt, total) {
   clearInterval(rest.iv);
-  rest.left = seconds; rest.total = seconds;
+  rest.endAt = endAt; rest.total = total;
+  if (S.active) { S.active.restEndAt = endAt; S.active.restTotal = total; save(); }
   $('#restBar').classList.remove('hidden');
-  paintRest();
-  rest.iv = setInterval(() => {
-    rest.left--;
-    if (rest.left <= 0) { endRest(true); } else paintRest();
-  }, 1000);
+  document.body.classList.add('resting');
+  tickRest();
+  rest.iv = setInterval(tickRest, 1000);
+}
+function tickRest() {
+  if (!rest.endAt) return;
+  rest.left = Math.ceil((rest.endAt - Date.now()) / 1000);
+  if (rest.left <= 0) endRest(true); else paintRest();
+  paintMinutes();
 }
 function paintRest() {
-  const m = Math.floor(rest.left / 60), s = rest.left % 60;
+  const left = Math.max(0, rest.left);
+  const m = Math.floor(left / 60), s = left % 60;
   $('#restTime').textContent = `${m}:${String(s).padStart(2, '0')}`;
-  $('#restFill').style.width = (rest.left / rest.total * 100) + '%';
+  $('#restFill').style.width = Math.min(100, left / rest.total * 100) + '%';
+}
+function paintMinutes() {
+  const pill = $('#woMins');
+  if (pill && S.active) pill.textContent = `${activeMinutes()} min`;
 }
 function endRest(ding) {
   clearInterval(rest.iv); rest.iv = null;
+  const wasRunning = !!rest.endAt;
+  rest.endAt = 0;
   $('#restBar').classList.add('hidden');
-  if (ding) {
+  document.body.classList.remove('resting');
+  if (S.active && S.active.restEndAt) { delete S.active.restEndAt; delete S.active.restTotal; save(); }
+  if (ding && wasRunning) {
+    announce('Rest over');
     try { navigator.vibrate && navigator.vibrate([200, 100, 200]); } catch (e) {}
     try {
       unlockAudio();
@@ -361,8 +385,17 @@ function endRest(ding) {
     } catch (e) {}
   }
 }
-$('#restPlus').onclick = () => { rest.left += 30; rest.total += 30; paintRest(); };
+function announce(msg) {
+  const el = $('#srLive'); if (!el) return;
+  el.textContent = ''; setTimeout(() => { el.textContent = msg; }, 50);
+}
+$('#restPlus').onclick = () => { if (rest.endAt) runRest(rest.endAt + 30000, rest.total + 30); };
 $('#restSkip').onclick = () => endRest(false);
+// Coming back from a locked phone / background: repaint immediately (and ding if it's over).
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { tickRest(); paintMinutes(); } });
+window.addEventListener('pageshow', () => { tickRest(); paintMinutes(); });
+// keep the workout's "N min" pill fresh without a full re-render
+setInterval(paintMinutes, 30000);
 
 // ============================================================ workout tab
 function suggestedDay() {
@@ -1272,3 +1305,8 @@ async function downloadFile(name, text) {
 }
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => { tab = b.dataset.tab; openLogger = null; render(); });
 render();
+// resume a rest timer that was running before a reload / iOS page eviction
+if (S.active && S.active.restEndAt) {
+  if (S.active.restEndAt > Date.now()) runRest(S.active.restEndAt, S.active.restTotal || 90);
+  else { delete S.active.restEndAt; delete S.active.restTotal; save(); }
+}

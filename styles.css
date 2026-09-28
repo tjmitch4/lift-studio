@@ -278,3 +278,8 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 .banner.warn { background: var(--accent-soft); border: 1px solid var(--accent); }
 .set-dot.extra { border-style: solid; border-color: var(--line); color: var(--text-dim); font-size: 1.2rem; }
 .btn-ghost.danger { color: var(--red); border-color: var(--red); }
+
+/* keep the rest bar from covering the bottom of the page (Finish workout) */
+body.resting { padding-bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom) + 84px); }
+body.resting .toast { bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom) + 90px); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }

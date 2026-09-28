@@ -23,7 +23,7 @@
 
 <main id="view" class="view"></main>
 
-<div id="restBar" class="rest-bar hidden">
+<div id="restBar" class="rest-bar hidden" role="timer" aria-label="Rest timer">
   <div class="rest-info">
     <div class="rest-label">REST</div>
     <div class="rest-time" id="restTime">1:30</div>
@@ -55,6 +55,7 @@
 </nav>
 
 <div id="modalRoot"></div>
+<div id="srLive" class="sr-only" aria-live="assertive"></div>
 
 <script src="program.js"></script>
 <script src="app.js"></script>
