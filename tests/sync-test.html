@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Lift Studio — sync engine tests</title>
+<title>Lift Studio — GitHub sync tests</title>
 <style>
   body { font: 14px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; background: #0e1116; color: #e8ecf2; margin: 16px; }
   h1 { font-size: 1.1rem; }
@@ -15,398 +15,493 @@
 </style>
 </head>
 <body>
-<h1>Lift Studio — sync engine tests (mock Dropbox, two simulated devices)</h1>
+<h1>Lift Studio — GitHub sync engine tests (mock Git Data API, simulated devices)</h1>
 <div id="summary">running…</div>
 <table id="results"></table>
 
 <script src="../program.js"></script>
 <script src="../sync-merge.js"></script>
 <script src="../state.js"></script>
-<script src="../dropbox-sync.js"></script>
+<script src="../watch-import.js"></script>
+<script src="../lift-md.js"></script>
+<script src="../github-sync.js"></script>
+<script src="mock-github.js"></script>
 <script>
 'use strict';
 const C = LiftMerge.canonical;
 const clone = v => JSON.parse(JSON.stringify(v));
-
-// ------------------------------------------------------------ mock Dropbox
-// namespaces: 'home' (member folder) and 'root' (team space). files: path(lowercase) -> {text, rev}
-function mockDropbox(opt = {}) {
-  const m = {
-    offline: false, calls: [], revN: 0,
-    ns: { home: new Map(), root: new Map() },
-    folders: { home: new Set(opt.homeFolders || ['/tj/fitness']), root: new Set(opt.rootFolders || []) },
-    tokens: new Set(), refresh: new Map(), revoked: new Set(),
-    beforeUpload: null, // hook(pathKey, nsName) run once before an upload is applied
-    expireAll() { m.tokens.clear(); },
-  };
-  const json = (status, body, headers) => new Response(JSON.stringify(body), { status, headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}) });
-  const err = (status, summary) => json(status, { error_summary: summary, error: {} });
-  const nsOf = h => {
-    const pr = h['Dropbox-API-Path-Root'];
-    if (!pr) return 'home';
-    const v = JSON.parse(pr);
-    return v['.tag'] === 'root' && v.root === '4242' ? 'root' : 'bad';
-  };
-  m.put = (ns, path, text) => { const rev = 'r' + (++m.revN); m.ns[ns].set(path.toLowerCase(), { text, rev, path }); return rev; };
-  m.get = (ns, path) => m.ns[ns].get(path.toLowerCase());
-  m.fetch = async (url, init = {}) => {
-    const h = init.headers || {};
-    const ep = url.replace(/^https:\/\/[^/]+\/(2\/)?/, '');
-    m.calls.push({ ep, h: clone(h), body: typeof init.body === 'string' ? init.body : null });
-    if (m.offline) throw new TypeError('Failed to fetch');
-    if (ep === 'oauth2/token') {
-      const p = new URLSearchParams(init.body);
-      if (p.get('client_id') !== 'testkey') return json(400, { error: 'invalid_client' });
-      if (p.get('grant_type') === 'authorization_code') {
-        if (p.get('code') !== 'GOODCODE' || !p.get('code_verifier')) return json(400, { error: 'invalid_grant', error_description: 'code doesn\'t exist or has expired' });
-        const at = 'at' + Math.random(), rt = 'rt' + Math.random();
-        m.tokens.add(at); m.refresh.set(rt, true);
-        return json(200, { access_token: at, expires_in: 14400, refresh_token: rt, account_id: 'dbid:TJ', token_type: 'bearer' });
-      }
-      if (p.get('grant_type') === 'refresh_token') {
-        if (!m.refresh.get(p.get('refresh_token'))) return json(400, { error: 'invalid_grant', error_description: 'refresh token is invalid or revoked' });
-        const at = 'at' + Math.random(); m.tokens.add(at);
-        return json(200, { access_token: at, expires_in: 14400, token_type: 'bearer' });
-      }
-      return json(400, { error: 'unsupported_grant_type' });
-    }
-    const tok = String(h.Authorization || '').replace('Bearer ', '');
-    if (!m.tokens.has(tok)) return err(401, 'expired_access_token/');
-    const ns = nsOf(h);
-    if (ns === 'bad') return err(400, 'invalid_root');
-    if (ep === 'auth/token/revoke') { m.tokens.delete(tok); m.refresh.clear(); m.revoked.add(tok); return new Response('null', { status: 200 }); }
-    if (ep === 'users/get_current_account') return json(200, { account_id: 'dbid:TJ', root_info: { '.tag': 'team', root_namespace_id: '4242', home_namespace_id: '1111' } });
-    if (ep === 'files/get_metadata') {
-      const { path } = JSON.parse(init.body);
-      if (m.folders[ns].has(path.toLowerCase())) return json(200, { '.tag': 'folder', path_display: path });
-      const f = m.get(ns, path);
-      return f ? json(200, { '.tag': 'file', rev: f.rev, path_display: f.path }) : err(409, 'path/not_found/..');
-    }
-    const arg = JSON.parse(h['Dropbox-API-Arg']);
-    if (/[^\x00-\x7e]/.test(h['Dropbox-API-Arg'])) return err(400, 'non-ASCII header');
-    if (ep === 'files/download') {
-      const f = m.get(ns, arg.path);
-      if (!f) return err(409, 'path/not_found/');
-      return new Response(f.text, { status: 200, headers: { 'Dropbox-API-Result': JSON.stringify({ rev: f.rev, path_display: f.path }) } });
-    }
-    if (ep === 'files/upload') {
-      if (m.beforeUpload) { const hook = m.beforeUpload; m.beforeUpload = null; await hook(arg.path, ns); }
-      const cur = m.get(ns, arg.path);
-      const mode = arg.mode;
-      if (mode['.tag'] === 'add' && cur) return err(409, 'path/conflict/file/');
-      if (mode['.tag'] === 'update' && (!cur || cur.rev !== mode.update)) return err(409, 'path/conflict/file/');
-      const rev = m.put(ns, arg.path, init.body);
-      return json(200, { rev, path_display: arg.path });
-    }
-    return err(400, 'unknown endpoint ' + ep);
-  };
-  return m;
-}
+const TOKEN_KEY = 'studioData.githubToken';
 
 // ------------------------------------------------------------ simulated device
 function memStorage() { const d = {}; return { getItem: k => (k in d ? d[k] : null), setItem: (k, v) => { d[k] = String(v); }, removeItem: k => { delete d[k]; }, _d: d }; }
+const alive = [];
 function device(name, mock, initial, extra) {
-  const dev = { name, S: normalize(clone(initial || freshState())), storage: memStorage(), statuses: [], blocked: false, watchAdds: 0 };
-  dev.engine = LiftDropbox.create(Object.assign({
-    appKey: 'testkey', storage: dev.storage, storageKey: 'liftstudio.dropbox',
+  const dev = { name, S: normalize(clone(initial || freshState())), storage: memStorage(), blocked: false, watchAdds: 0, applied: 0 };
+  dev.engine = LiftGitHub.create(Object.assign({
+    storage: dev.storage,
     fetch: (...a) => mock.fetch(...a),
-    redirectUri: () => 'http://localhost:8781/',
-    openUrl: url => { dev.openedUrl = url; },
+    userAgent: name === 'phone' ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)' : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
     getState: () => dev.S,
-    applyState: merged => { dev.S = merged; },
+    applyState: merged => { dev.S = merged; dev.applied++; },
     normalize,
     merge: (a, b) => LiftMerge.mergeStates(a, b, { seed: SEED_PROGRAM }),
     canSync: () => !dev.blocked,
-    importWatch: text => { // stand-in for app.js parseWatchFile + mergeWatchEntries (same id + tombstone rules)
-      let added = 0;
-      const dead = new Set(dev.S.tombstones.cardio.map(t => t.id));
-      text.split(/\r?\n/).forEach(line => {
-        const [date, kind, mins] = line.split(',');
-        if (!date || !mins) return;
-        const wkey = `${date}|${kind}|${+mins}`, id = watchCardioId(wkey);
-        if (dev.S.cardio.some(c => c.id === id) || dead.has(id)) return;
-        dev.S.cardio.push({ id, updatedAt: dateStamp(date), date, kind, minutes: +mins, distance: '', note: '', source: 'watch', hr: null, cal: null, wkey });
-        added++;
-      });
-      dev.watchAdds += added;
-      return added;
+    importInbox: text => { // the same code path as app.js (watch-import.js)
+      const parsed = LiftWatch.parse(String(text || ''));
+      if (!parsed.length) return { parsed: 0, added: 0 };
+      const r = LiftWatch.mergeInto(dev.S, parsed);
+      dev.watchAdds += r.added;
+      return { parsed: parsed.length, added: r.added };
     },
-    onStatus: s => dev.statuses.push(s.state),
+    coachMarkdown: () => `# Lift Studio — Coach Report\n\n${dev.S.sessions.length} workouts, ${dev.S.cardio.length} cardio\n`,
     log: () => {},
+    intervalMs: 1e9,
   }, extra || {}));
-  dev.signIn = async () => {
-    await dev.engine.authUrl('code'); dev.engine.markCodeOpened();
-    return dev.engine.completeCode('GOODCODE');
-  };
+  dev.connect = (tok = 'GOOD') => dev.engine.connect(tok);
+  dev.sync = (why = 'interval') => dev.engine.syncNow(why);
   dev.edit = fn => { fn(dev.S); };
+  alive.push(dev);
   return dev;
 }
-const sess = (id, date, day, updatedAt, reps = 8) => ({ id, day, date, minutes: 45, updatedAt, entries: { bench: { target: 135, sets: [{ reps, weight: 135, effort: 'solid', note: '', t: Date.parse(date + 'T18:00:00Z') }] } } });
-const DATA = '/TJ/Fitness/Lift Studio/lift-studio-data.json';
-const cloudState = (mock, ns = 'home', prefix = '') => { const f = mock.get(ns, prefix + DATA); return f ? normalize(JSON.parse(f.text)) : null; };
+const sess = (id, date, day, updatedAt, reps = 8, extra) => Object.assign({ id, day, date, minutes: 45, updatedAt, entries: { bench: { target: 135, sets: [{ reps, weight: 135, effort: 'solid', note: '', t: Date.parse(date + 'T18:00:00Z') }] } } }, extra || {});
+const card = (id, date, kind, minutes, updatedAt, extra) => Object.assign({ id, date, kind, minutes, distance: '', note: '', hr: null, cal: null, updatedAt }, extra || {});
+const lift = mock => Object.keys(mock.files()).filter(p => p.startsWith('lift/')).sort();
+const recFiles = (mock, dir) => lift(mock).filter(p => p.startsWith('lift/' + dir + '/') && p.endsWith('.md'));
+const recsIn = (mock, dir) => recFiles(mock, dir).map(p => LiftMd.parse(mock.files()[p]));
 
 // ------------------------------------------------------------ cases
 const cases = [];
 const test = (name, fn) => cases.push({ name, fn });
 function assert(c, msg) { if (!c) throw new Error(msg || 'assertion failed'); }
-const uploads = mock => mock.calls.filter(c => c.ep === 'files/upload');
 
-test('authorize URL (redirect flow): all PKCE params + redirect_uri + state', async () => {
-  const d = device('A', mockDropbox());
-  const url = new URL(await d.engine.beginRedirect());
-  assert(d.openedUrl === url.href, 'opened');
-  const p = url.searchParams;
-  assert(url.origin + url.pathname === 'https://www.dropbox.com/oauth2/authorize', url.pathname);
-  assert(p.get('client_id') === 'testkey' && p.get('response_type') === 'code', 'client_id/response_type');
-  assert(/^[A-Za-z0-9_-]{43}$/.test(p.get('code_challenge')), 'S256 challenge is 43 b64url chars');
-  assert(p.get('code_challenge_method') === 'S256' && p.get('token_access_type') === 'offline');
-  assert(p.get('redirect_uri') === 'http://localhost:8781/' && p.get('state'), 'redirect_uri + state');
-  // the challenge really is SHA-256(verifier)
-  const v = d.engine._store().pending.verifier;
-  const dig = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(v)));
-  const b64 = btoa(String.fromCharCode(...dig)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  assert(b64 === p.get('code_challenge'), 'challenge matches verifier');
+test('git blob sha matches git (hello\\n -> ce0136…) and base64 handles UTF-8', async () => {
+  assert(await LiftGitHub.gitBlobSha('hello\n') === 'ce013625030ba8dba906f756967f9e9ca394464a');
+  const s = 'Café 💪🏽 “x” \n日本';
+  assert(LiftGitHub.b64ToUtf8(LiftGitHub.utf8ToB64(s)) === s);
+  assert(LiftGitHub.b64ToUtf8(LiftGitHub.utf8ToB64(s).replace(/(.{8})/g, '$1\n')) === s, 'GitHub wraps base64 lines');
 });
 
-test('authorize URL (code flow): no redirect_uri, verifier reused across reloads', async () => {
-  const d = device('A', mockDropbox());
-  const u1 = new URL(await d.engine.authUrl('code'));
-  assert(!u1.searchParams.has('redirect_uri') && !u1.searchParams.has('state'), 'no redirect_uri/state');
-  assert(u1.searchParams.get('token_access_type') === 'offline' && u1.searchParams.get('code_challenge_method') === 'S256');
-  const u2 = new URL(await d.engine.authUrl('code'));
-  assert(u1.href === u2.href, 'same pending verifier');
-});
-
-test('redirect return: code exchanged with redirect_uri, URL cleaned, bad state rejected', async () => {
-  const mock = mockDropbox();
-  const d = device('A', mock);
-  const url = new URL(await d.engine.beginRedirect());
-  const bad = await d.engine.handleRedirect('http://localhost:8781/?code=GOODCODE&state=nope');
-  assert(bad.handled && !bad.ok, 'bad state rejected');
-  await d.engine.beginRedirect();
-  const st = d.engine._store().pending.state;
-  const r = await d.engine.handleRedirect('http://localhost:8781/?code=GOODCODE&state=' + st + '#x');
-  assert(r.ok && r.cleanUrl === '/#x', JSON.stringify(r));
-  const tokCall = mock.calls.filter(c => c.ep === 'oauth2/token').pop();
-  const p = new URLSearchParams(tokCall.body);
-  assert(p.get('redirect_uri') === 'http://localhost:8781/' && p.get('code_verifier') && !p.get('client_secret'));
-  assert(d.engine.signedIn());
-  const none = await d.engine.handleRedirect('http://localhost:8781/');
-  assert(!none.handled);
-});
-
-test('code flow: wrong code fails cleanly, right code signs in (no redirect_uri sent)', async () => {
-  const mock = mockDropbox();
-  const d = device('A', mock);
-  await d.engine.authUrl('code'); d.engine.markCodeOpened();
-  assert(d.engine.getStatus().pendingCode, 'paste box state persists');
-  let threw = false;
-  try { await d.engine.completeCode('WRONG'); } catch (e) { threw = true; }
-  assert(threw && !d.engine.signedIn(), 'wrong code rejected');
-  await d.engine.completeCode('GOODCODE');
-  const p = new URLSearchParams(mock.calls.filter(c => c.ep === 'oauth2/token').pop().body);
-  assert(!p.has('redirect_uri') && d.engine.signedIn() && !d.engine.getStatus().pendingCode);
-});
-
-test('first sync on first device: creates the file (mode add), local unchanged', async () => {
-  const mock = mockDropbox();
-  const a = device('A', mock, Object.assign(freshState(), { sessions: [sess('a1', '2026-09-01', 'push', 100)] }));
-  await a.signIn();
-  const up = uploads(mock);
-  assert(up.length === 1 && JSON.parse(up[0].h['Dropbox-API-Arg']).mode['.tag'] === 'add', 'one add upload');
-  assert(cloudState(mock).sessions.length === 1);
+test('connect: good token stored + first sync; headers right; token never in a URL', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock, Object.assign(freshState(), { sessions: [sess('a1', '2026-09-01', 'push', 100)] }));
+  assert(a.engine.getStatus().state === 'signedout');
+  const r = await a.connect();
+  assert(r === 'pushed', r);
+  assert(a.storage.getItem(TOKEN_KEY) === 'GOOD', 'stored under the shared key');
   assert(a.engine.getStatus().state === 'synced', a.engine.getStatus().state);
+  mock.calls.forEach(c => {
+    assert(c.headers.Authorization === 'Bearer GOOD' && c.headers.Accept === 'application/vnd.github+json' && c.headers['X-GitHub-Api-Version'] === '2022-11-28', 'headers ' + c.url);
+    assert(c.cache === 'no-store', 'cache no-store');
+    assert(c.url.indexOf('GOOD') < 0 && c.url.startsWith('https://api.github.com/repos/tjmitch4/studio-data'), c.url);
+  });
+  assert(mock.calls[0].method === 'GET' && /\/repos\/tjmitch4\/studio-data$/.test(mock.calls[0].url), 'validated first');
 });
 
-test('two devices with different history: first sync merges both ways, nothing lost', async () => {
-  const mock = mockDropbox();
+test('connect errors: 401, 404 (not granted), read-only; nothing stored', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock);
+  const err = async tok => { try { await a.connect(tok); } catch (e) { return e; } return null; };
+  const e401 = await err('NOPE');
+  assert(e401 && e401.kind === 'auth' && /rejected/.test(e401.message), e401 && e401.message);
+  const e404 = await err('OTHERREPO');
+  assert(e404 && e404.kind === 'notfound' && /Only select repositories/.test(e404.message), e404 && e404.message);
+  const ro = await err('READONLY');
+  assert(ro && ro.kind === 'readonly' && /Read and write/.test(ro.message), ro && ro.message);
+  const empty = await err('  ');
+  assert(empty && empty.kind === 'input');
+  assert(a.storage.getItem(TOKEN_KEY) === null && !a.engine.connected(), 'nothing stored');
+  assert(!mock.calls.some(c => c.method !== 'GET'), 'no writes');
+});
+
+test('first sync uploads everything as Markdown in ONE commit; files parse back losslessly', async () => {
+  const mock = mockGitHub();
+  const init = Object.assign(freshState(), {
+    sessions: [sess('p1', '2026-09-01', 'push', 100, 8, { bodyCheck: 'tight', bodyNote: 'Trap “tight” — neck\nnote 💪' })],
+    cardio: [card('c1', '2026-09-02', 'Hoops', 75, 5, { note: 'won 11-9 | "great"' })],
+    events: [{ id: 'e1', updatedAt: 7, date: '2026-09-01', exId: 'bench', kind: 'up', from: 135, to: 140 }],
+    active: { id: 'w9', day: 'legs', date: '2026-09-05', startedAt: 1, entries: {} }, activeUpdatedAt: 50,
+  });
+  const a = device('phone', mock, init);
+  await a.connect();
+  assert(mock.commitCount() === 2, 'initial + ONE sync commit, got ' + mock.commitCount());
+  const files = lift(mock);
+  ['lift/settings.md', 'lift/active.md', 'lift/COACH.md', 'lift/workouts/2026-09-01-push-p1.md', 'lift/cardio/2026-09-02-hoops-c1.md']
+    .forEach(p => assert(files.includes(p), 'missing ' + p + ' in ' + files.join(', ')));
+  assert(mock.lastMessage() === 'lift: sync (4 changed) from iPhone-' + a.storage.getItem('liftstudio.deviceId'), mock.lastMessage());
+  const back = LiftMd.parse(mock.files()['lift/workouts/2026-09-01-push-p1.md']);
+  assert(C(back) === C(a.S.sessions[0]), 'lossless');
+  assert(C(LiftMd.parse(mock.files()['lift/cardio/2026-09-02-hoops-c1.md'])) === C(a.S.cardio[0]));
+  assert(mock.files()['guitar/.gitkeep'] !== undefined && mock.files()['README.md'] !== undefined, 'other files untouched');
+});
+
+test('idle syncs make no commit (fast path = 1 request; unrelated guitar/ commit = no commit)', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock, Object.assign(freshState(), { sessions: [sess('a1', '2026-09-01', 'push', 100)] }));
+  await a.connect();
+  const n = mock.commitCount(), calls = mock.calls.length;
+  assert(await a.sync() === 'unchanged');
+  assert(mock.calls.length === calls + 1, 'one request: ' + (mock.calls.length - calls));
+  await mock.commitExternal({ 'guitar/sessions/x.md': 'guitar stuff' }, 'guitar: sync');
+  const r = await a.sync();
+  assert(r === 'unchanged' && mock.commitCount() === n + 1, r + ' commits ' + mock.commitCount());
+  assert(!mock.calls.slice(calls).some(c => /\/git\/blobs\//.test(c.url)), 'no blob downloads');
+  // rest-timer housekeeping is device-local: no commit
+  a.edit(S => { S.active = { id: 'w1', day: 'push', date: '2026-09-28', startedAt: 1, entries: {} }; S.activeUpdatedAt = 5; });
+  await a.sync();
+  const m = mock.commitCount();
+  a.edit(S => { S.active.restEndAt = Date.now() + 90000; S.active.restTotal = 90; });
+  assert(await a.sync() === 'unchanged' && mock.commitCount() === m, 'rest timer not synced');
+});
+
+test('two devices with different history: first syncs merge both ways, converge, no ping-pong', async () => {
+  const mock = mockGitHub();
   const phone = device('phone', mock, Object.assign(freshState(), { sessions: [sess('p1', '2026-09-01', 'push', 0), sess('p2', '2026-09-03', 'pull', 0)] }));
   phone.S.exercises.find(e => e.id === 'bench').weight = 140;
   phone.S.events.push({ id: 'ev1', updatedAt: 0, date: '2026-09-01', exId: 'bench', kind: 'up', from: 135, to: 140 });
   phone.S = normalize(phone.S);
   const pc = device('pc', mock, Object.assign(freshState(), { sessions: [sess('d1', '2026-08-28', 'legs', 0)], cardio: [{ date: '2026-08-29', kind: 'Row', minutes: 20 }] }));
   pc.S.settings.restDefault = 75;
-  await pc.signIn();     // cloud := PC
-  await phone.signIn();  // phone merges PC's cloud copy + its own, uploads union
-  await pc.engine.syncNow('interval'); // PC pulls
-  const cloud = cloudState(mock);
-  assert(cloud.sessions.map(s => s.id).join() === 'd1,p1,p2', cloud.sessions.map(s => s.id).join());
+  await pc.connect();
+  await phone.connect();
+  await pc.sync();
+  assert(recsIn(mock, 'workouts').map(s => s.id).sort().join() === 'd1,p1,p2', 'all workouts in repo');
   assert(C(phone.S) === C(pc.S), 'devices converged');
-  assert(C(normalize(clone(phone.S))) === C(cloud), 'cloud == devices');
   assert(pc.S.exercises.find(e => e.id === 'bench').weight === 140, 'phone progression reached PC');
   assert(phone.S.settings.restDefault === 75, 'PC setting reached phone');
-  assert(phone.S.cardio.length === 1);
-  // steady state: another pass does not upload again
-  const n = uploads(mock).length;
-  await phone.engine.syncNow('interval'); await pc.engine.syncNow('interval');
-  assert(uploads(mock).length === n, 'no ping-pong uploads');
+  assert(phone.S.cardio.length === 1 && recFiles(mock, 'cardio').length === 1);
+  const n = mock.commitCount();
+  await phone.sync(); await pc.sync(); await phone.sync();
+  assert(mock.commitCount() === n, 'no ping-pong commits');
 });
 
-test('409 conflict: another device writes between download and upload -> re-merge + retry', async () => {
-  const mock = mockDropbox();
-  const a = device('A', mock), b = device('B', mock);
-  await a.signIn(); await b.signIn();
+test('settings merge per field across devices (bar weight on phone, rest on PC)', async () => {
+  const mock = mockGitHub();
+  const a = device('phone', mock), b = device('pc', mock);
+  await a.connect(); await b.connect();
+  a.edit(S => { S.settings.barWeight = 35; S.settingsTs.barWeight = Date.now(); });
+  b.edit(S => { S.settings.restDefault = 120; S.settingsTs.restDefault = Date.now(); });
+  await a.sync(); await b.sync(); await a.sync();
+  assert(a.S.settings.barWeight === 35 && a.S.settings.restDefault === 120, C(a.S.settings));
+  assert(C(a.S) === C(b.S));
+  const s = LiftMd.parse(mock.files()['lift/settings.md']);
+  assert(s.settings.barWeight === 35 && s.settings.restDefault === 120 && s.settingsTs.barWeight > 0);
+});
+
+test('local delete: file removed in the commit; other device drops the record', async () => {
+  const mock = mockGitHub();
+  const a = device('phone', mock, Object.assign(freshState(), { sessions: [sess('s1', '2026-09-01', 'push', 100), sess('s2', '2026-09-02', 'pull', 100)] }));
+  const b = device('pc', mock);
+  await a.connect(); await b.connect();
+  assert(b.S.sessions.length === 2);
+  a.edit(S => { S.sessions = S.sessions.filter(s => s.id !== 's1'); S.tombstones.sessions.push({ id: 's1', deleted: true, updatedAt: Date.now() }); });
+  await a.sync();
+  assert(recFiles(mock, 'workouts').length === 1 && !recFiles(mock, 'workouts').some(p => p.includes('s1')), recFiles(mock, 'workouts').join());
+  await b.sync();
+  assert(b.S.sessions.length === 1 && b.S.sessions[0].id === 's2');
+  assert(C(a.S) === C(b.S), 'converged');
+});
+
+test('remote delete (file deleted on GitHub / in Obsidian): removed here, not re-uploaded', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock, Object.assign(freshState(), { cardio: [card('c1', '2026-09-01', 'Run', 20, 10), card('c2', '2026-09-02', 'Row', 15, 10)] }));
+  await a.connect();
+  const p = recFiles(mock, 'cardio').find(x => x.includes('c1'));
+  await mock.commitExternal({ [p]: null }, 'deleted on github.com');
+  const r = await a.sync();
+  assert(a.S.cardio.map(c => c.id).join() === 'c2', 'dropped: ' + a.S.cardio.map(c => c.id).join());
+  assert(a.S.tombstones.cardio.some(t => t.id === 'c1'), 'tombstone recorded so other devices drop it too');
+  assert(!lift(mock).includes(p), 'not re-uploaded');
+  const b = device('phone', mock, Object.assign(freshState(), { cardio: [card('c1', '2026-09-01', 'Run', 20, 10)] }));
+  await b.connect();
+  assert(!b.S.cardio.some(c => c.id === 'c1'), 'a device that never synced also drops it');
+  assert(r === 'pushed' || r === 'pulled', r);
+});
+
+test('edit vs delete: file deleted remotely but edited here since the last sync -> kept, same path', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock, Object.assign(freshState(), { sessions: [sess('s1', '2026-09-01', 'push', 100)] }));
+  await a.connect();
+  const p = recFiles(mock, 'workouts')[0];
+  await mock.commitExternal({ [p]: null }, 'deleted elsewhere');
+  a.edit(S => { S.sessions[0].minutes = 61; S.sessions[0].updatedAt = Date.now(); });
+  await a.sync();
+  assert(a.S.sessions.length === 1 && lift(mock).includes(p), 'kept + re-created at ' + p);
+  assert(LiftMd.parse(mock.files()[p]).minutes === 61);
+  // tombstone (app delete) vs newer edit on another device: newer edit wins everywhere
+  const b = device('phone', mock);
+  await b.connect();
+  a.edit(S => { S.sessions = []; S.tombstones.sessions.push({ id: 's1', deleted: true, updatedAt: Date.now() - 5000 }); });
+  b.edit(S => { S.sessions[0].minutes = 70; S.sessions[0].updatedAt = Date.now(); });
+  await a.sync(); await b.sync(); await a.sync();
+  assert(a.S.sessions.length === 1 && a.S.sessions[0].minutes === 70 && C(a.S) === C(b.S), 'edit newer than delete survives');
+});
+
+test('SAFETY: repo wiped / recreated (all files gone) never deletes local data — it re-uploads', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock, Object.assign(freshState(), {
+    sessions: [sess('s1', '2026-09-01', 'push', 1), sess('s2', '2026-09-02', 'pull', 1)],
+    cardio: [card('c1', '2026-09-01', 'Run', 20, 1), card('c2', '2026-09-02', 'Row', 15, 1), card('c3', '2026-09-03', 'Walk', 30, 1)] }));
+  await a.connect();
+  // someone empties lift/ (or the repo is recreated / force-pushed)
+  const wipe = {}; lift(mock).forEach(p => { wipe[p] = null; });
+  await mock.commitExternal(wipe, 'wipe');
+  await a.sync();
+  assert(a.S.sessions.length === 2 && a.S.cardio.length === 3, 'local data intact: ' + a.S.sessions.length + '/' + a.S.cardio.length);
+  assert(!a.S.tombstones.sessions.length && !a.S.tombstones.cardio.length, 'no tombstones minted');
+  assert(recFiles(mock, 'workouts').length === 2 && recFiles(mock, 'cardio').length === 3, 're-uploaded');
+  assert(/vanished/.test(a.engine.getStatus().notice), 'notice shown');
+  // many files deleted by hand at once (settings.md kept): also treated as suspicious
+  const some = {}; recFiles(mock, 'cardio').forEach(p => { some[p] = null; }); recFiles(mock, 'workouts').forEach(p => { some[p] = null; });
+  await mock.commitExternal(some, 'bulk delete');
+  await a.sync();
+  assert(a.S.cardio.length === 3 && a.S.sessions.length === 2, 'bulk hand-deletion not applied');
+});
+
+test('SAFETY: reconnecting to a different/fresh repo keeps everything (cache is reset on connect)', async () => {
+  const mock1 = mockGitHub();
+  let current = mock1;
+  const a = device('pc', { fetch: (...x) => current.fetch(...x) }, Object.assign(freshState(), { sessions: [sess('s1', '2026-09-01', 'push', 1)], cardio: [card('c1', '2026-09-01', 'Run', 20, 1)] }));
+  await a.connect();
+  a.engine.disconnect();
+  current = mockGitHub(); // e.g. repo deleted and recreated
+  await a.connect();
+  assert(a.S.sessions.length === 1 && a.S.cardio.length === 1, 'kept');
+  assert(recFiles(current, 'workouts').length === 1 && recFiles(current, 'cardio').length === 1, 'uploaded to the new repo');
+});
+
+test('bulk delete made IN THE APP (tombstones) still propagates, e.g. Reset everywhere', async () => {
+  const mock = mockGitHub();
+  const recs = Array.from({ length: 6 }, (_, i) => card('c' + i, '2026-09-0' + (i + 1), 'Run', 20, 1));
+  const a = device('phone', mock, Object.assign(freshState(), { cardio: recs }));
+  const b = device('pc', mock);
+  await a.connect(); await b.connect();
+  a.edit(S => { const now = Date.now(); S.tombstones.cardio = S.cardio.map(c => ({ id: c.id, deleted: true, updatedAt: now })); S.cardio = []; });
+  await a.sync(); await b.sync();
+  assert(b.S.cardio.length === 0 && recFiles(mock, 'cardio').length === 0, 'deleted everywhere');
+});
+
+test('path stays stable when a record\'s content or date changes', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock, Object.assign(freshState(), { cardio: [card('c1', '2026-09-01', 'Run', 20, 10)] }));
+  await a.connect();
+  const p = recFiles(mock, 'cardio')[0];
+  a.edit(S => { S.cardio[0].date = '2026-09-03'; S.cardio[0].kind = 'Walk'; S.cardio[0].updatedAt = Date.now(); });
+  await a.sync();
+  assert(recFiles(mock, 'cardio').length === 1 && recFiles(mock, 'cardio')[0] === p, recFiles(mock, 'cardio').join());
+  assert(LiftMd.parse(mock.files()[p]).date === '2026-09-03');
+});
+
+test('non-fast-forward: another device commits mid-sync -> restart, both changes land', async () => {
+  const mock = mockGitHub();
+  const a = device('phone', mock), b = device('pc', mock);
+  await a.connect(); await b.connect();
   a.edit(S => S.sessions.push(sess('fromA', '2026-09-10', 'push', Date.now())));
   b.edit(S => S.sessions.push(sess('fromB', '2026-09-10', 'legs', Date.now())));
-  mock.beforeUpload = async () => { await b.engine.syncNow('race'); }; // B slips in first
-  const r = await a.engine.syncNow('save');
+  mock.beforePatch = async () => { mock.beforePatch = null; await b.sync('race'); }; // B slips in first
+  const r = await a.sync('save');
   assert(r === 'pushed', r);
-  const ids = cloudState(mock).sessions.map(s => s.id).sort().join();
-  assert(ids === 'fromA,fromB', ids);
-  const confl = mock.calls.filter(c => c.ep === 'files/upload').length;
-  assert(confl >= 3, 'A uploaded twice (one 409) + B once');
-  await b.engine.syncNow('interval');
+  assert(recsIn(mock, 'workouts').map(s => s.id).sort().join() === 'fromA,fromB');
+  assert(mock.rejectedPatches === 1, 'one rejected ref update');
+  await b.sync();
   assert(C(a.S) === C(b.S));
 });
 
-test('conflict retries are capped (max 3) and end as an error, not a loop', async () => {
-  const mock = mockDropbox();
-  const a = device('A', mock);
-  await a.signIn();
+test('non-fast-forward retries are capped at 3 tries, then an error (local data intact)', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock);
+  await a.connect();
   a.edit(S => S.sessions.push(sess('x', '2026-09-11', 'push', Date.now())));
   let races = 0;
-  const race = async () => { races++; mock.put('home', DATA, mock.get('home', DATA).text); mock.beforeUpload = race; };
-  mock.beforeUpload = race;
-  const r = await a.engine.syncNow('save');
-  mock.beforeUpload = null;
-  assert(r === 'error:conflict' && races === 4, r + ' races=' + races);
+  const race = async () => { races++; await mock.commitExternal({ 'guitar/x.md': 'v' + races }, 'guitar'); mock.beforePatch = race; };
+  mock.beforePatch = race;
+  const r = await a.sync('save');
+  mock.beforePatch = null;
+  assert(r === 'error:conflict' && races === 3, r + ' races=' + races);
   assert(a.S.sessions.some(s => s.id === 'x'), 'local data intact');
-  assert(await a.engine.syncNow('retry') === 'pushed');
+  assert(await a.sync('manual') === 'pushed');
 });
 
-test('offline -> online: silent offline status, data kept, pushed when back', async () => {
-  const mock = mockDropbox();
-  const a = device('A', mock);
-  await a.signIn();
-  mock.offline = true;
-  a.edit(S => S.cardio.push({ id: 'c-off', updatedAt: Date.now(), date: '2026-09-12', kind: 'Run', minutes: 25, distance: '', note: '' }));
-  const r = await a.engine.syncNow('save');
-  assert(r === 'error:network' && a.engine.getStatus().state === 'offline', r + ' ' + a.engine.getStatus().state);
-  mock.offline = false;
-  assert(await a.engine.syncNow('online') === 'pushed');
-  assert(cloudState(mock).cardio.some(c => c.id === 'c-off'));
-  assert(a.engine.getStatus().state === 'synced');
+test('corrupt file is skipped with a warning, never deleted or overwritten, sync continues', async () => {
+  const mock = mockGitHub();
+  await mock.commitExternal({ 'lift/workouts/2026-09-01-push-s1.md': '# my notes\n\n## Data\n```json\n{ broken\n```\n', 'lift/cardio/notes.md': 'hand-written, no data block' }, 'human');
+  const a = device('pc', mock, Object.assign(freshState(), { sessions: [sess('s1', '2026-09-01', 'push', 100)] }));
+  const r = await a.connect();
+  assert(r === 'pushed', r);
+  assert(a.engine.getStatus().state === 'synced' && a.engine.getStatus().warnings.length === 2, C(a.engine.getStatus()));
+  assert(mock.files()['lift/workouts/2026-09-01-push-s1.md'].includes('{ broken'), 'corrupt file untouched');
+  assert(mock.files()['lift/cardio/notes.md'] === 'hand-written, no data block');
+  const mine = recFiles(mock, 'workouts').filter(p => p !== 'lift/workouts/2026-09-01-push-s1.md');
+  assert(mine.length === 1 && /-s1-2\.md$/.test(mine[0]), 'written beside it: ' + mine.join());
+  const blobs = mock.calls.filter(c => /\/git\/blobs\//.test(c.url)).length;
+  await a.sync();
+  assert(mock.calls.filter(c => /\/git\/blobs\//.test(c.url)).length === blobs, 'known-bad file not re-downloaded');
 });
 
-test('delete propagates: tombstone on A removes the session on B', async () => {
-  const mock = mockDropbox();
-  const a = device('A', mock, Object.assign(freshState(), { sessions: [sess('s1', '2026-09-01', 'push', 100)] }));
-  const b = device('B', mock);
-  await a.signIn(); await b.signIn();
-  assert(b.S.sessions.length === 1);
-  a.edit(S => { S.sessions = []; S.tombstones.sessions.push({ id: 's1', deleted: true, updatedAt: Date.now() }); });
-  await a.engine.syncNow('save'); await b.engine.syncNow('interval');
-  assert(b.S.sessions.length === 0 && b.S.tombstones.sessions.length === 1);
-});
-
-test('watch CSV auto-import: imports once per rev, missing file is fine, deletes stick', async () => {
-  const mock = mockDropbox();
-  const a = device('A', mock);
-  await a.signIn();
-  assert(a.engine.getStatus().state === 'synced', 'no CSV -> still synced');
-  mock.put('home', '/TJ/Fitness/watch-workouts.csv', '2026-09-20,Basketball,62\n2026-09-21,Rowing,15\n');
-  await a.engine.syncNow('interval');
+test('Apple Watch inbox: imported, deduped, deleted in the same commit; deletes stick', async () => {
+  const mock = mockGitHub();
+  const a = device('phone', mock);
+  await a.connect();
+  await mock.commitExternal({ 'lift/inbox/watch-2026-09-21.csv': '2026-09-20 18:00,Basketball,62,480,142\n2026-09-21 07:10,Rowing,15 min,120,128\n' }, 'shortcut');
+  const n = mock.commitCount();
+  await a.sync();
   assert(a.watchAdds === 2 && a.S.cardio.length === 2, 'imported 2');
-  assert(cloudState(mock).cardio.length === 2, 'and uploaded in the same pass');
-  const downloads = () => mock.calls.filter(c => c.ep === 'files/download' && /watch/.test(c.h['Dropbox-API-Arg'])).length;
-  const n = downloads();
-  await a.engine.syncNow('interval');
-  assert(downloads() === n, 'same rev -> not downloaded again');
-  // delete one, then the shortcut rewrites the file (new rev, same rows)
-  const gone = a.S.cardio[0].id;
+  assert(!lift(mock).some(p => p.startsWith('lift/inbox/')), 'inbox emptied');
+  assert(recFiles(mock, 'cardio').length === 2 && mock.commitCount() === n + 1, 'cardio files in the same single commit');
+  // delete one, then the shortcut uploads the same week again + a new row
+  const gone = a.S.cardio.find(c => c.kind === 'Hoops').id;
   a.edit(S => { S.cardio = S.cardio.filter(c => c.id !== gone); S.tombstones.cardio.push({ id: gone, deleted: true, updatedAt: Date.now() }); });
-  mock.put('home', '/TJ/Fitness/watch-workouts.csv', '2026-09-20,Basketball,62\n2026-09-21,Rowing,15\n2026-09-22,Rowing,20\n');
-  await a.engine.syncNow('interval');
-  assert(a.S.cardio.length === 2 && !a.S.cardio.some(c => c.id === gone), 'deleted row not re-imported, new row imported');
-  // a second device importing the same file produces the same ids: no duplicates
-  const b = device('B', mock);
-  await b.signIn();
-  assert(C(a.S) === C(b.S), 'B converged');
+  await a.sync();
+  const b = device('pc', mock); await b.connect(); // B has the tombstone via settings.md
+  await mock.commitExternal({ 'lift/inbox/watch-2026-09-22.csv': '2026-09-20 18:00,Basketball,62,480,142\n2026-09-21 07:10,Rowing,15 min,120,128\n2026-09-22 06:30,Running,30:00,300,150\n' }, 'shortcut');
+  await b.sync(); // the OTHER device picks up the inbox this time
+  assert(b.S.cardio.length === 2 && !b.S.cardio.some(c => c.id === gone), 'deleted row not re-imported: ' + b.S.cardio.map(c => c.kind).join());
+  await a.sync();
+  assert(C(a.S) === C(b.S), 'converged');
+  // unparseable inbox file is left in place (with a warning), not deleted
+  await mock.commitExternal({ 'lift/inbox/oops.json': '{"hello": "world"}' }, 'bad');
+  await a.sync();
+  assert(lift(mock).includes('lift/inbox/oops.json') && a.engine.getStatus().warnings.includes('lift/inbox/oops.json'));
 });
 
-test('Business team path fallback: /TJ/Fitness missing at home -> team root + "/TJ Mitchell", cached', async () => {
-  const mock = mockDropbox({ homeFolders: [], rootFolders: ['/tj mitchell/tj/fitness'] });
-  const a = device('A', mock);
-  await a.signIn();
-  assert(a.engine._store().pathMode === 'root' && a.engine._store().rootNs === '4242', JSON.stringify(a.engine._store()));
-  assert(mock.get('root', '/TJ Mitchell' + DATA), 'file written in team root');
-  const up = uploads(mock)[0];
-  assert(JSON.parse(up.h['Dropbox-API-Path-Root']).root === '4242', 'path-root header');
-  const probes = mock.calls.filter(c => c.ep === 'users/get_current_account').length;
-  await a.engine.syncNow('interval');
-  assert(mock.calls.filter(c => c.ep === 'users/get_current_account').length === probes, 'cached, no re-probe');
+test('active workout started on the phone is continued on the PC, then finished', async () => {
+  const mock = mockGitHub();
+  const phone = device('phone', mock), pc = device('pc', mock);
+  await phone.connect(); await pc.connect();
+  const t0 = Date.now();
+  phone.edit(S => { S.active = { id: 'w1', day: 'push', date: '2026-09-28', startedAt: t0, entries: { bench: { target: 135, sets: [{ reps: 8, weight: 135, effort: 'solid', note: '', t: t0 + 1 }] } } }; S.activeUpdatedAt = t0 + 1; });
+  await phone.sync();
+  assert(lift(mock).includes('lift/active.md'));
+  await pc.sync();
+  assert(pc.S.active && pc.S.active.id === 'w1' && pc.S.active.entries.bench.sets.length === 1, 'PC sees the workout');
+  pc.edit(S => { S.active.entries.bench.sets.push({ reps: 7, weight: 135, effort: 'grind', note: 'phone died', t: t0 + 2 }); S.activeUpdatedAt = t0 + 2; });
+  await pc.sync(); await phone.sync();
+  assert(phone.S.active.entries.bench.sets.length === 2, 'phone sees the PC set');
+  // finish on the phone
+  phone.edit(S => { const a = S.active; a.minutes = 40; delete a.startedAt; a.updatedAt = t0 + 3; S.sessions.push(a); S.active = null; S.activeUpdatedAt = t0 + 3; });
+  await phone.sync();
+  assert(!lift(mock).includes('lift/active.md'), 'active.md deleted on finish');
+  assert(recFiles(mock, 'workouts').some(p => p.endsWith('-push-w1.md')), 'workout file');
+  await pc.sync();
+  assert(pc.S.active === null && pc.S.sessions.some(s => s.id === 'w1'), 'PC: active gone, session there');
+  // discarded on one device -> gone on the other (file deletion, unedited)
+  pc.edit(S => { S.active = { id: 'w2', day: 'legs', date: '2026-09-29', startedAt: t0 + 10, entries: {} }; S.activeUpdatedAt = t0 + 10; });
+  await pc.sync(); await phone.sync();
+  assert(phone.S.active && phone.S.active.id === 'w2');
+  phone.edit(S => { S.active = null; S.activeUpdatedAt = t0 + 11; });
+  await phone.sync(); await pc.sync();
+  assert(pc.S.active === null && !lift(mock).includes('lift/active.md'), 'discard propagated');
 });
 
-test('folder missing everywhere: clear error, nothing uploaded', async () => {
-  const mock = mockDropbox({ homeFolders: [], rootFolders: [] });
-  const a = device('A', mock);
-  await a.signIn();
-  assert(a.engine.getStatus().state === 'error' && /Fitness/.test(a.engine.getStatus().lastError));
-  assert(uploads(mock).length === 0);
+test('COACH.md regenerated with data changes only', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock);
+  await a.connect();
+  assert(/0 workouts/.test(mock.files()['lift/COACH.md']));
+  a.edit(S => S.sessions.push(sess('s1', '2026-09-12', 'push', Date.now())));
+  await a.sync();
+  assert(/1 workouts/.test(mock.files()['lift/COACH.md']), 'updated in the data commit');
+  const n = mock.commitCount();
+  await a.sync(); await a.sync('manual');
+  assert(mock.commitCount() === n, 'no coach-only commits');
 });
 
-test('non-ASCII in Dropbox-API-Arg is \\u-escaped', async () => {
-  const s = LiftDropbox.headerJson({ path: '/TJ/Fitness/Café ✓.json' });
-  assert(/^[\x20-\x7e]*$/.test(s) && JSON.parse(s).path === '/TJ/Fitness/Café ✓.json', s);
-  const mock = mockDropbox();
-  const a = device('A', mock, null, { dataPath: '/TJ/Fitness/Lift Studio/données.json' });
-  await a.signIn();
-  assert(a.engine.getStatus().state === 'synced', a.engine.getStatus().lastError);
+test('offline -> silent "offline" status + retry timer; data kept; pushed when back', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock);
+  await a.connect();
+  mock.offline = true;
+  a.edit(S => S.cardio.push(card('c-off', '2026-09-12', 'Run', 25, Date.now())));
+  const r = await a.sync('save');
+  assert(r === 'error:network' && a.engine.getStatus().state === 'offline', r + ' ' + a.engine.getStatus().state);
+  assert(a.engine.hasPending(), 'backoff retry scheduled');
+  mock.offline = false;
+  assert(await a.sync('online') === 'pushed');
+  assert(recsIn(mock, 'cardio').some(c => c.id === 'c-off') && a.engine.getStatus().state === 'synced');
 });
 
-test('corrupt cloud file is never overwritten', async () => {
-  const mock = mockDropbox();
-  mock.put('home', DATA, '{ this is not json');
-  const a = device('A', mock);
-  await a.signIn();
-  assert(a.engine.getStatus().state === 'error' && uploads(mock).length === 0);
-  assert(mock.get('home', DATA).text === '{ this is not json');
+test('rate limited: backs off (status offline), respects reset header, then syncs', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock);
+  await a.connect();
+  mock.rateLimitNext = 1;
+  a.edit(S => S.sessions.push(sess('r1', '2026-09-12', 'push', Date.now())));
+  const r = await a.sync('save');
+  assert(r === 'error:ratelimit' && a.engine.getStatus().state === 'offline', r);
+  assert(await a.sync('interval') === 'backoff', 'automatic syncs wait for the reset time');
+  assert(await a.sync('manual') === 'pushed', 'manual sync tries anyway');
 });
 
-test('local data blocked (unreadable): never uploads', async () => {
-  const mock = mockDropbox();
-  const a = device('A', mock);
+test('local data unreadable (blocked): never touches the network', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock);
+  a.storage.setItem(TOKEN_KEY, 'GOOD');
   a.blocked = true;
-  await a.signIn();
-  assert(uploads(mock).length === 0 && a.engine.getStatus().state === 'error');
+  const r = await a.sync('load');
+  assert(r === 'blocked' && mock.calls.length === 0 && a.engine.getStatus().state === 'error');
 });
 
-test('expired access token: refreshed transparently', async () => {
-  const mock = mockDropbox();
-  const a = device('A', mock);
-  await a.signIn();
-  mock.expireAll();
-  a.edit(S => S.sessions.push(sess('late', '2026-09-13', 'push', Date.now())));
-  assert(await a.engine.syncNow('save') === 'pushed');
-  assert(mock.calls.some(c => c.ep === 'oauth2/token' && /refresh_token/.test(c.body)));
-});
-
-test('revoked refresh token: "reauth" state, local data untouched', async () => {
-  const mock = mockDropbox();
-  const a = device('A', mock, Object.assign(freshState(), { sessions: [sess('k', '2026-09-01', 'push', 1)] }));
-  await a.signIn();
-  mock.expireAll(); mock.refresh.clear();
-  await a.engine.syncNow('interval');
-  assert(a.engine.getStatus().state === 'reauth' && !a.engine.signedIn(), a.engine.getStatus().state);
+test('token that validates but can\'t write (fine-grained read-only): clear error, nothing lost', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock, Object.assign(freshState(), { sessions: [sess('k', '2026-09-01', 'push', 1)] }));
+  const r = await a.connect('SNEAKYRO');
+  assert(r === 'error:forbidden' && /Read and write/.test(a.engine.getStatus().lastError), r + ' ' + a.engine.getStatus().lastError);
   assert(a.S.sessions.length === 1);
 });
 
-test('sign out: token revoked, engine storage cleared, local data kept', async () => {
-  const mock = mockDropbox();
-  const a = device('A', mock, Object.assign(freshState(), { sessions: [sess('k', '2026-09-01', 'push', 1)] }));
-  await a.signIn();
-  await a.engine.signOut();
-  assert(mock.calls.some(c => c.ep === 'auth/token/revoke'), 'revoked');
-  assert(!a.engine.signedIn() && a.storage.getItem('liftstudio.dropbox') === '{}');
-  assert(a.S.sessions.length === 1);
-  assert(await a.engine.syncNow('interval') === 'skipped');
+test('revoked token mid-life: "error" with reconnect hint; local data untouched', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock, Object.assign(freshState(), { sessions: [sess('k', '2026-09-01', 'push', 1)] }));
+  await a.connect();
+  mock.revoke('GOOD');
+  a.edit(S => S.sessions.push(sess('k2', '2026-09-02', 'pull', Date.now())));
+  const r = await a.sync();
+  assert(r === 'error:auth' && a.engine.getStatus().state === 'error' && /paste a new one/.test(a.engine.getStatus().lastError));
+  assert(a.S.sessions.length === 2);
 });
 
-test('no app key: engine reports unconfigured and never calls the network', async () => {
-  const mock = mockDropbox();
-  const d = device('X', mock, null, { appKey: '' });
-  assert(d.engine.getStatus().state === 'unconfigured' && !d.engine.signedIn());
-  assert(await d.engine.syncNow('load') === 'skipped' && mock.calls.length === 0);
+test('disconnect: token removed, local data + other keys kept, no more network', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock, Object.assign(freshState(), { sessions: [sess('k', '2026-09-01', 'push', 1)] }));
+  await a.connect();
+  a.engine.disconnect();
+  assert(a.storage.getItem(TOKEN_KEY) === null && a.engine.getStatus().state === 'signedout');
+  const n = mock.calls.length;
+  assert(await a.sync() === 'skipped' && mock.calls.length === n);
+  assert(a.S.sessions.length === 1);
+});
+
+test('a token pasted in Guitar Studio (same key) is picked up without reconnecting', async () => {
+  const mock = mockGitHub();
+  const a = device('pc', mock, Object.assign(freshState(), { cardio: [card('c1', '2026-09-01', 'Walk', 30, 1)] }));
+  assert(await a.sync() === 'skipped');
+  a.storage.setItem(TOKEN_KEY, 'GOOD'); // what the other app does
+  assert(await a.sync() === 'pushed' && recFiles(mock, 'cardio').length === 1);
+});
+
+test('old-format data (v1, no ids) on two devices syncs without duplicates', async () => {
+  const raw = { settings: { barWeight: '45' }, exercises: [], days: [],
+    sessions: [{ day: 'push', date: '2026-08-30', entries: { bench: { target: 135, sets: [{ reps: 8, weight: 135, effort: 'solid' }, null] } } }],
+    cardio: [{ date: '2026-08-31', kind: 'Walk', minutes: '30' }, { date: '2026-08-31', kind: 'Walk', minutes: 30 }] };
+  const mock = mockGitHub();
+  const a = device('phone', mock, raw), b = device('pc', mock, raw);
+  await a.connect(); await b.connect(); await a.sync();
+  assert(a.S.sessions.length === 1 && a.S.cardio.length === 2, a.S.sessions.length + '/' + a.S.cardio.length);
+  assert(recFiles(mock, 'workouts').length === 1 && recFiles(mock, 'cardio').length === 2);
+  assert(C(a.S) === C(b.S));
+});
+
+test('first sync of a device with lots of existing history onto a populated repo: no loss', async () => {
+  const mock = mockGitHub();
+  const many = n => Array.from({ length: n }, (_, i) => sess('h' + i, '2026-0' + (1 + (i % 8)) + '-1' + (i % 9), ['push', 'pull', 'legs'][i % 3], 1000 + i));
+  const pc = device('pc', mock, Object.assign(freshState(), { sessions: many(25) }));
+  await pc.connect();
+  const phone = device('phone', mock, Object.assign(freshState(), { sessions: many(40).slice(10), cardio: [card('pc1', '2026-09-01', 'Row', 15, 3)] }));
+  const n = mock.commitCount();
+  await phone.connect(); await pc.sync();
+  assert(phone.S.sessions.length === 40 && pc.S.sessions.length === 40, phone.S.sessions.length + ' ' + pc.S.sessions.length);
+  assert(recFiles(mock, 'workouts').length === 40 && recFiles(mock, 'cardio').length === 1);
+  assert(mock.commitCount() === n + 1, 'phone uploaded everything in one commit');
+  assert(C(phone.S) === C(pc.S));
 });
 
 // ------------------------------------------------------------ run (sequential, async)
@@ -415,6 +510,7 @@ test('no app key: engine reports unconfigured and never calls the network', asyn
   for (const c of cases) {
     let ok = true, err = '';
     try { await c.fn(); } catch (e) { ok = false; err = e.message; console.error(c.name, e); }
+    alive.splice(0).forEach(d => d.engine.dispose());
     if (ok) pass++;
     rows.push(`<tr><td class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</td><td>${c.name}${err ? `<br><code>${err.replace(/</g, '&lt;')}</code>` : ''}</td></tr>`);
     document.getElementById('results').innerHTML = rows.join('');

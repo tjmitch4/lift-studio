@@ -9,8 +9,8 @@ const LS_KEY = 'liftstudio.v1';
 // save() refuses to write, so a parse bug can never silently overwrite TJ's real log.
 let loadProblem = null;
 let saveFailed = false;
-let sync = null;             // Dropbox sync engine (null when DROPBOX_APP_KEY is empty)
-let applyingRemote = false;  // true while saving a merged copy that came from Dropbox
+let sync = null;             // GitHub sync engine (github-sync.js); idle until a token is pasted
+let applyingRemote = false;  // true while saving a merged copy that came from GitHub
 let S = load();
 function load() {
   let raw = null;
@@ -39,7 +39,9 @@ function save() {
   try {
     localStorage.setItem(LS_KEY, JSON.stringify(S));
     if (saveFailed) { saveFailed = false; render(); }
-    if (sync && !applyingRemote) sync.schedule(); // push to Dropbox 2s after the last change
+    coachReportCache = null;
+    // push to GitHub 5s after the last change (~20s when only the in-progress workout changed)
+    if (sync && !applyingRemote) sync.schedule();
   } catch (e) {
     console.error('Lift Studio: save failed', e && e.name, e);
     if (!saveFailed) { saveFailed = true; render(); toast("Couldn't save — export a backup now."); }
@@ -118,8 +120,8 @@ function backupAgeText() {
     : d === 0 ? 'Last backup: today.' : `Last backup: ${d} day${d > 1 ? 's' : ''} ago.`;
 }
 function backupOverdue() {
-  // Dropbox sync is the backup: no nag while it's working
-  const ss = sync && sync.signedIn() ? sync.getStatus() : null;
+  // GitHub sync is the backup: no nag while it's working
+  const ss = syncOn() ? sync.getStatus() : null;
   if (ss && ss.lastSyncedAt && Date.now() - ss.lastSyncedAt < 14 * 86400000) return false;
   const d = backupDays();
   return S.sessions.length > 0 && (d == null || d > 14);
@@ -860,127 +862,12 @@ function chartSVG(hist, isTimed) {
 }
 
 // ============================================================ apple watch import
-const WATCH_KIND_MAP = {
-  basketball: 'Hoops', tennis: 'Tennis', pickleball: 'Tennis', paddle: 'Tennis',
-  row: 'Row', run: 'Run', walk: 'Walk', hik: 'Walk',
-};
-function mapWatchKind(name) {
-  const k = String(name || '').toLowerCase();
-  for (const key of Object.keys(WATCH_KIND_MAP)) if (k.includes(key)) return WATCH_KIND_MAP[key];
-  return 'Other';
-}
-function localDateOf(d) {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-// Safari's Date parser rejects 'yyyy-MM-dd HH:mm:ss -0400' (Health Auto Export) and treats a
-// bare 'yyyy-MM-dd' as UTC midnight (the previous day in Boston). Normalize before parsing.
-function parseDateLoose(v) {
-  if (v instanceof Date) return v;
-  if (typeof v === 'number') return new Date(v);
-  const s = String(v == null ? '' : v).trim();
-  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?\s*(Z|[+-]\d{2}:?\d{2})?$/i);
-  if (!m) return new Date(s);
-  const [, y, mo, d, hh, mm, ss, tz] = m;
-  if (hh == null) return new Date(+y, +mo - 1, +d, 12); // date only -> local noon
-  const iso = `${y}-${mo}-${d}T${hh.padStart(2, '0')}:${mm}:${ss || '00'}`;
-  if (!tz) return new Date(+y, +mo - 1, +d, +hh, +mm, +(ss || 0)); // no zone -> local time
-  const zone = tz.toUpperCase() === 'Z' ? 'Z' : tz.replace(/^([+-]\d{2}):?(\d{2})$/, '$1:$2');
-  return new Date(iso + zone);
-}
-function parseWatchDuration(v) {
-  if (v == null || v === '') return null;
-  const s = String(v).trim().toLowerCase();
-  // unit words, e.g. '1 hr 5 min', '45 min', '1h 5m 30s', '2 hours'
-  const unit = re => { const m = s.match(re); return m ? parseFloat(m[1]) : 0; };
-  // (?![a-z]) rather than \b so compact forms like '1h5m' still split: \b fails between 'h' and '5'
-  if (/\d\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)(?![a-z])/.test(s)) {
-    const h = unit(/(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)(?![a-z])/);
-    const m = unit(/(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)(?![a-z])/);
-    const sec = unit(/(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)(?![a-z])/);
-    const total = Math.round(h * 60 + m + sec / 60);
-    return total > 0 ? total : null;
-  }
-  if (s.includes(':')) {
-    const p = s.split(':').map(Number);
-    if (p.some(isNaN)) return null;
-    return p.length === 3 ? p[0] * 60 + p[1] + Math.round(p[2] / 60) : p[0] + Math.round(p[1] / 60);
-  }
-  const n = parseFloat(s.replace(/[^\d.]/g, ''));
-  if (isNaN(n) || n <= 0) return null;
-  return n > 300 ? Math.round(n / 60) : Math.round(n); // >300 assume seconds
-}
-function numOnly(v) {
-  const n = parseFloat(String(v ?? '').replace(/[^\d.]/g, ''));
-  return isNaN(n) ? null : Math.round(n);
-}
-function parseWatchFile(text) {
-  const out = [];
-  // 1) JSON — Health Auto Export shape, or any {workouts:[...]} / bare array
-  try {
-    const j = JSON.parse(text);
-    const ws = (j && j.data && j.data.workouts) || (j && j.workouts) || (Array.isArray(j) ? j : null);
-    if (ws && Array.isArray(ws)) {
-      ws.forEach(w => {
-        if (!w || typeof w !== 'object') return;
-        const start = w.start || w.startDate || w.date;
-        if (!start) return;
-        const d = parseDateLoose(start);
-        if (isNaN(d)) return;
-        let mins = parseWatchDuration(w.duration);
-        const end = w.end || w.endDate;
-        if (!mins && end) { const e = parseDateLoose(end); if (!isNaN(e)) mins = Math.round((e - d) / 60000); }
-        if (!mins || mins <= 0) return;
-        out.push({
-          date: localDateOf(d),
-          rawKind: w.name || w.workoutActivityType || w.type || 'Other',
-          minutes: mins,
-          cal: numOnly(w.activeEnergyBurned && w.activeEnergyBurned.qty != null ? w.activeEnergyBurned.qty : (w.activeEnergy ?? w.calories)),
-          hr: numOnly(w.heartRateData && w.heartRateData.average != null ? w.heartRateData.average : (w.avgHeartRate ?? w.heartRateAvg)),
-        });
-      });
-      return out;
-    }
-  } catch (e) { /* not JSON — fall through to line format */ }
-  // 2) line format from the Shortcut: datetime,type,duration,calories,avgHR
-  text.split(/\r?\n/).forEach(line => {
-    const parts = line.split(/[,|;\t]/).map(x => x.trim());
-    if (parts.length < 3) return;
-    const d = parseDateLoose(parts[0]);
-    if (isNaN(d)) return;
-    const mins = parseWatchDuration(parts[2]);
-    if (!mins) return;
-    out.push({ date: localDateOf(d), rawKind: parts[1], minutes: mins, cal: numOnly(parts[3]), hr: numOnly(parts[4]) });
-  });
-  return out;
-}
+// Parser + dedupe live in watch-import.js (pure, shared with the GitHub inbox + tests).
+const parseWatchFile = text => LiftWatch.parse(String(text || ''));
 function mergeWatchEntries(parsed) {
-  const seen = new Set(S.cardio.filter(c => c.wkey).map(c => c.wkey));
-  // entries deleted here (or on another device) stay deleted: their tombstone id matches
-  const deleted = new Set((S.tombstones.cardio || []).map(t => t.id));
-  let added = 0, skipped = 0;
-  for (const p of parsed) {
-    const kind = mapWatchKind(p.rawKind);
-    const wkey = `${p.date}|${kind}|${p.minutes}`;
-    const id = watchCardioId(wkey);
-    // skip exact watch re-imports, and manual entries that look like the same workout
-    const manualDupe = S.cardio.some(c => !c.wkey && c.date === p.date && c.kind === kind && Math.abs(c.minutes - p.minutes) <= 5);
-    if (seen.has(wkey) || deleted.has(id) || manualDupe) { skipped++; continue; }
-    seen.add(wkey);
-    S.cardio.push({
-      // deterministic stamp: two devices importing the same row produce identical records
-      id, updatedAt: dateStamp(p.date),
-      date: p.date, kind, minutes: p.minutes, distance: '',
-      note: kind === 'Other' ? String(p.rawKind) : '',
-      source: 'watch', hr: p.hr || null, cal: p.cal || null, wkey,
-    });
-    added++;
-  }
-  if (added) {
-    S.cardio.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
-    coachReportCache = null;
-    save();
-  }
-  return { added, skipped };
+  const res = LiftWatch.mergeInto(S, parsed);
+  if (res.added) { coachReportCache = null; save(); }
+  return res;
 }
 
 // ============================================================ cardio tab
@@ -1011,7 +898,7 @@ function renderCardio() {
   </div>
   <div class="card">
     <div class="hist-head">
-      <div><b>Apple Watch</b><div class="faint" style="margin-top:2px">Pick the file your Sync Workouts shortcut saves (Files → Dropbox or iCloud Drive)</div></div>
+      <div><b>Apple Watch</b><div class="faint" style="margin-top:2px">With GitHub sync on, the Sync Workouts shortcut's uploads import by themselves. Or pick an exported file (CSV or Health Auto Export JSON).</div></div>
       <button class="btn-ghost" id="watchImport">Import</button>
     </div>
     <input type="file" id="watchFile" accept=".csv,.txt,.json,text/csv,text/plain,application/json" class="hidden">
@@ -1074,44 +961,69 @@ function renderCardio() {
 }
 
 // ============================================================ coach tab
+// The Coach Report: shown on the Coach tab, copied to the clipboard, and written to
+// lift/COACH.md in the studio-data repo on every sync that changes data (Claude reads it there).
 function coachReport() {
   if (coachReportCache && coachReportDay === todayISO()) return coachReportCache;
   const L = [];
+  const setTxt = (ex, x) => ex && ex.type === 'timed' ? `${x.reps}s` : ex && ex.type === 'bodyweight' ? `${x.reps}${x.weight ? `×BW+${fmtW(x.weight)}` : ''}` : `${x.reps}×${fmtW(x.weight)}`;
+  const ln = s => String(s).replace(/\s*\r?\n\s*/g, ' / '); // keep list items on one line
+  const lastSession = S.sessions[S.sessions.length - 1];
   L.push(`# Lift Studio — Coach Report`);
-  L.push(`Generated ${todayISO()} · ${S.sessions.length} workouts logged\n`);
+  L.push(`Generated ${todayISO()} · ${S.sessions.length} workouts logged${lastSession ? ` · last workout ${lastSession.date} (${daysAgo(lastSession.date)}d ago)` : ''}\n`);
+  L.push(`> For Claude: TJ's strength log from the Lift Studio app, regenerated whenever his data changes. Weights are lb.`);
+  L.push(`> Effort per set: easy / solid / grind. Raw records live next to this file: \`lift/workouts/\`, \`lift/cardio/\`, \`lift/settings.md\`.\n`);
 
-  L.push(`## Current targets`);
+  L.push(`## Program & rules`);
+  L.push(`- Rotation: ${S.days.map(d => d.name).join(' → ')} (next up: ${dayName(suggestedDay())})`);
+  L.push(`- Double progression: after ${S.settings.progressAfter} straight sessions with every set at the top of the rep range at the target weight, the app suggests moving up one step; after ${S.settings.deloadAfter} sessions below the range it suggests a ${Math.round(S.settings.deloadPct * 100)}% deload. TJ confirms each change.`);
+  L.push(`- Rest: ${S.settings.restDefault}s isolation, ${S.settings.restCompound}s barbell compounds`);
+  L.push(`- Home gym: ${fmtW(S.settings.barWeight)} lb bar, plate pairs ${S.settings.platePairs.map(fmtW).join(', ')}`);
+  L.push(`- Neck/shoulders are the known issue: a check is recorded after Push and Pull days.`);
+
+  L.push(`\n## Current targets`);
   for (const d of S.days) {
     L.push(`\n### ${d.name}`);
     S.exercises.filter(e => e.day === d.id).forEach(e => {
-      const w = e.weight == null ? 'TBD' : e.type === 'timed' ? `${e.repHigh}s target` : `${fmtW(e.weight)} lb (${e.loadLabel})`;
+      const w = e.weight == null ? 'weight TBD' : e.type === 'timed' ? `${e.repHigh}s target` : `${fmtW(e.weight)} lb (${e.loadLabel})`;
       const reps = e.type === 'timed' ? `${e.sets} holds` : `${e.sets}×${e.repLow}–${e.repHigh}`;
-      L.push(`- ${e.name} — ${reps} @ ${w}`);
+      const last = exHistory(e.id).slice(-1)[0];
+      L.push(`- ${e.name} — ${reps} @ ${w}${last ? ` · last ${last.date}: ${last.sets.map(x => setTxt(e, x)).join(', ')}` : ' · not logged yet'}${e.coachNote ? ` · note: ${e.coachNote}` : ''}`);
+    });
+  }
+  const bonus = S.exercises.filter(e => e.bonus);
+  if (bonus.length) {
+    L.push(`\n### Bonus exercises (added on the fly, no progression rules)`);
+    bonus.forEach(e => {
+      const n = exHistory(e.id).length;
+      L.push(`- ${e.name} (${e.type}) — logged in ${n} session${n === 1 ? '' : 's'}`);
     });
   }
 
   const recent = S.sessions.slice(-6);
   if (recent.length) {
-    L.push(`\n## Recent sessions`);
+    L.push(`\n## Recent sessions (last ${recent.length})`);
     recent.forEach(s => {
       L.push(`\n### ${s.date} — ${dayName(s.day)} (${s.minutes || '?'} min)`);
       for (const exId of Object.keys(s.entries)) {
-        const ex = exById(exId); if (!ex) continue;
+        const ex = exById(exId);
         const e = s.entries[exId];
-        const isTimed = ex.type === 'timed';
-        const sets = e.sets.map(x => isTimed ? `${x.reps}s` : ex.type === 'bodyweight' ? `${x.reps}` : `${x.reps}×${fmtW(x.weight)}`).join(', ');
+        const sets = e.sets.map(x => setTxt(ex, x)).join(', ');
         const efforts = e.sets.map(x => x.effort);
         const effTxt = efforts.every(x => x === efforts[0]) ? efforts[0] : efforts.join('/');
-        const notes = e.sets.filter(x => x.note).map(x => `"${x.note}"`).join('; ');
-        L.push(`- ${ex.name}: ${sets} (${effTxt})${notes ? ` — ${notes}` : ''}`);
+        const notes = e.sets.filter(x => x.note).map(x => `"${ln(x.note)}"`).join('; ');
+        const tgt = ex && ex.type !== 'timed' && ex.type !== 'bodyweight' && e.target != null ? ` [target ${fmtW(e.target)}]` : '';
+        L.push(`- ${ex ? ex.name : exId}${tgt}: ${sets} (${effTxt})${notes ? ` — ${notes}` : ''}`);
       }
-      if (s.bodyCheck) L.push(`- Neck/shoulders: ${s.bodyCheck}${s.bodyNote ? ` — "${s.bodyNote}"` : ''}`);
+      if (s.bodyCheck) L.push(`- Neck/shoulders: ${s.bodyCheck}${s.bodyNote ? ` — "${ln(s.bodyNote)}"` : ''}`);
+      const sg = (s.suggestions || []).filter(x => x && x.kind !== 'set');
+      if (sg.length) L.push(`- Progression check: ${sg.map(x => `${(exById(x.exId) || {}).name || x.exId} ${x.kind} → ${fmtW(x.to)}${x.kind === 'time' ? 's' : ''} ${x.applied ? '(applied)' : '(declined)'}`).join('; ')}`);
     });
   }
 
   const ev = S.events.slice(-12);
   if (ev.length) {
-    L.push(`\n## Progression events`);
+    L.push(`\n## Progression events (last ${ev.length})`);
     ev.forEach(e => {
       const ex = exById(e.exId);
       const what = e.kind === 'up' ? `moved up ${fmtW(e.from)} → ${fmtW(e.to)} lb`
@@ -1121,6 +1033,15 @@ function coachReport() {
       L.push(`- ${e.date}: ${ex ? ex.name : e.exId} ${what}`);
     });
   }
+
+  // rhythm over four weeks
+  const s28 = S.sessions.filter(s => daysAgo(s.date) < 28);
+  const c28 = S.cardio.filter(c => daysAgo(c.date) < 28);
+  L.push(`\n## Last 4 weeks`);
+  const byDay = {};
+  s28.forEach(s => { byDay[dayName(s.day)] = (byDay[dayName(s.day)] || 0) + 1; });
+  L.push(`- Lifting: ${s28.length} workout${s28.length === 1 ? '' : 's'}${s28.length ? ` (${Object.keys(byDay).map(k => `${byDay[k]} ${k}`).join(', ')})` : ''}`);
+  L.push(`- Cardio & sports: ${c28.length} session${c28.length === 1 ? '' : 's'}, ${c28.reduce((n, c) => n + (c.minutes || 0), 0)} min`);
 
   const c14 = S.cardio.filter(c => daysAgo(c.date) < 14);
   L.push(`\n## Cardio & sports (last 14 days)`);
@@ -1136,6 +1057,21 @@ function coachReport() {
       const hr = b.hrs.length ? `, avg HR ${Math.round(b.hrs.reduce((a, x) => a + x, 0) / b.hrs.length)}` : '';
       L.push(`- ${k}: ${b.n}× (${b.min} min total${hr})`);
     });
+    L.push(`\nEntries:`);
+    c14.slice(-10).forEach(c => {
+      const bits = [`${c.minutes} min`];
+      if (c.distance) bits.push(c.distance);
+      if (c.hr) bits.push(`avg HR ${c.hr}`);
+      if (c.cal) bits.push(`${c.cal} cal`);
+      if (c.source === 'watch') bits.push('watch');
+      L.push(`- ${c.date} ${c.kind}: ${bits.join(', ')}${c.note ? ` — "${ln(c.note)}"` : ''}`);
+    });
+  }
+
+  if (S.active) {
+    const n = Object.values(S.active.entries).reduce((k, e) => k + e.sets.length, 0);
+    L.push(`\n## In progress`);
+    L.push(`- ${dayName(S.active.day)} started ${S.active.date}: ${n} set${n === 1 ? '' : 's'} logged so far`);
   }
 
   // flags
@@ -1149,8 +1085,9 @@ function coachReport() {
     if (last && last.sets.filter(x => x.effort === 'grind').length >= 2) flags.push(`${ex.name}: multiple grind sets last session`);
   });
   S.sessions.slice(-4).forEach(s => {
-    if (s.bodyCheck === 'pain') flags.push(`${s.date} (${dayName(s.day)}): neck/shoulders bothered TJ${s.bodyNote ? ` — "${s.bodyNote}"` : ''}`);
+    if (s.bodyCheck === 'pain') flags.push(`${s.date} (${dayName(s.day)}): neck/shoulders bothered TJ${s.bodyNote ? ` — "${ln(s.bodyNote)}"` : ''}`);
   });
+  if (lastSession && daysAgo(lastSession.date) >= 7) flags.push(`No lifting logged for ${daysAgo(lastSession.date)} days`);
   L.push(`\n## Flags for coaching`);
   L.push(flags.length ? flags.map(f => `- ${f}`).join('\n') : `- nothing flagged`);
 
@@ -1160,12 +1097,11 @@ function coachReport() {
 
 function renderCoach() {
   const report = coachReport();
-  const synced = !!(sync && sync.signedIn());
+  const synced = syncOn();
   let html = `<div class="hero"><h2>Coach hand-off</h2>
-    <div class="muted">Copy the report below and paste it to Claude for a coaching review. ${synced
-      ? 'Your log syncs to Dropbox automatically.'
-      : sync ? 'Data lives only on this device until you connect Dropbox sync below.'
-      : 'Data lives only on this device — use Export JSON below to back it up.'}</div></div>
+    <div class="muted">${synced
+      ? `Claude reads <b>lift/COACH.md</b> in your <b>${esc(repoName())}</b> repo — it's this report, rewritten every time your log syncs. Copying still works if you'd rather paste it.`
+      : `Copy the report below and paste it to Claude. Or connect GitHub sync below: then Claude reads <b>lift/COACH.md</b> in your <b>${esc(repoName())}</b> repo, always up to date.`}</div></div>
   <div class="btn-row" style="margin-bottom:12px">
     <button class="btn" id="copyReport">Copy coach report</button>
   </div>
@@ -1222,7 +1158,7 @@ function renderCoach() {
         data = normalize(data);
       } catch (e) { return toast('That file did not look like a Lift Studio backup.'); }
       const here = loadProblem ? 'unreadable data' : `${S.sessions.length} workouts and ${S.cardio.length} cardio entries${S.active ? ' plus the workout in progress' : ''}`;
-      if (sync && sync.signedIn() && !loadProblem) {
+      if (syncOn() && !loadProblem) {
         // With sync on, "replace" would be undone by the next sync anyway: merge instead.
         return confirmModal('Merge this backup?',
           `This device has ${here}. The file has ${data.sessions.length} workouts and ${data.cardio.length} cardio entries. They're combined (nothing here is removed) and the result syncs to your other devices.`,
@@ -1266,8 +1202,8 @@ function renderCoach() {
     save(); toast('Settings saved.');
   };
   $('#resetAll').onclick = () => {
-    if (sync && sync.signedIn()) {
-      return confirmModal('Reset everywhere?', 'Sync is on, so this wipes all workouts, cardio and settings here, in Dropbox and on your other devices. Export a JSON backup first if unsure.',
+    if (syncOn()) {
+      return confirmModal('Reset everywhere?', 'Sync is on, so this wipes all workouts, cardio and settings here, in the GitHub repo and on your other devices. Export a JSON backup first if unsure.',
         () => { endRest(false); S = wipedState(); loadProblem = null; openLogger = null; coachReportCache = null; save(); render(); toast('Fresh start.'); });
     }
     confirmModal('Reset everything?', 'All workouts, cardio, and settings are wiped. Export a JSON backup first if unsure.',
@@ -1290,17 +1226,7 @@ function wipedState() {
   return f;
 }
 
-// ============================================================ dropbox sync (ui)
-const isStandalone = () => window.navigator.standalone === true ||
-  !!(window.matchMedia && matchMedia('(display-mode: standalone)').matches);
-// Code-flow authorize URL, prepared ahead of time so "use a code" can be a real link:
-// iOS blocks window.open() that happens after an await.
-let codeUrl = null;
-function prepareCodeUrl() {
-  if (!sync || sync.signedIn() || codeUrl) return;
-  sync.authUrl('code').then(u => { codeUrl = u; paintSync(); }).catch(() => {});
-}
-
+// ============================================================ github sync (ui)
 function agoText(ms) {
   if (!ms) return 'never';
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
@@ -1312,89 +1238,87 @@ function agoText(ms) {
   return new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 const SYNC_LABEL = {
-  unconfigured: 'Sync not configured yet', signedout: 'Not connected', reauth: 'Dropbox sign-in expired',
-  idle: 'Connected', syncing: 'Syncing…', synced: 'Synced', offline: 'Offline — will retry', error: 'Sync problem',
+  signedout: 'Not connected', idle: 'Connected', syncing: 'Syncing…', synced: 'Synced',
+  offline: 'Offline — will retry', error: 'Sync problem',
 };
+const syncOn = () => !!(sync && sync.connected());
+const repoName = () => `${GITHUB_OWNER}/${GITHUB_REPO}`;
+
+function tokenFormHTML(replace) {
+  return `<details class="sync-howto"${replace ? '' : ' open'}>
+      <summary>How to make the token (2 minutes, once)</summary>
+      <ol>
+        <li>Open <a class="link" href="${esc(GITHUB_TOKEN_URL)}" target="_blank" rel="noopener">GitHub → new fine-grained token</a> (sign in if asked).</li>
+        <li>Name it <b>Studio apps</b>. Expiration: as long as you like — when it runs out, sync shows a problem and you paste a new one here.</li>
+        <li><b>Repository access</b> → <b>Only select repositories</b> → pick <b>${esc(GITHUB_REPO)}</b>.</li>
+        <li><b>Permissions</b> → <b>Repository permissions</b> → <b>Contents</b> → <b>Read and write</b>. Nothing else.</li>
+        <li><b>Generate token</b>, copy it, paste it below. It stays in this browser only, and Guitar Studio uses the same one.</li>
+      </ol>
+    </details>
+    <label for="ghToken" class="sync-code-label">${replace ? 'New token' : 'GitHub token'}</label>
+    <input type="password" id="ghToken" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="github_pat_…">
+    <div class="sync-err" id="ghErr" role="alert"></div>
+    <div class="btn-row" style="margin-top:8px"><button class="btn" id="ghConnect">${replace ? 'Use this token' : 'Connect'}</button></div>`;
+}
 function syncCardHTML() {
-  if (!sync) {
-    return `<div class="sync-line"><span class="sync-dot-inline s-unconfigured" aria-hidden="true"></span><b>Sync not configured yet</b></div>
-      <div class="faint">Dropbox sync switches on once the app key is added to <code>config.js</code>. Until then, use the manual backup below.</div>`;
-  }
+  if (!sync) return '';
   const st = sync.getStatus();
-  const codeLink = (cls, id, text) =>
-    `<a class="${cls}" id="${id}" data-codelink href="${esc(codeUrl || '#')}" target="_blank" rel="noopener">${text}</a>`;
-  if (!st.signedIn) {
-    const expired = st.state === 'reauth';
-    let body;
-    if (st.pendingCode) {
-      body = `<label for="dbxCode" class="sync-code-label">Paste the code from Dropbox</label>
-        <input type="text" id="dbxCode" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Code from the Dropbox page">
-        <div class="btn-row" style="margin-top:10px">
-          <button class="btn-ghost" id="dbxCodeCancel">Cancel</button>
-          <button class="btn" id="dbxCodeSubmit" style="flex:2">Connect</button>
-        </div>
-        ${codeLink('link-btn', 'dbxCodeAgain', 'Open Dropbox again for a new code')}`;
-    } else if (isStandalone()) {
-      // home-screen app: a redirect would come back in Safari, not here — code flow it is
-      body = `${codeLink('btn', 'dbxCodeOpen', expired ? 'Reconnect Dropbox' : 'Connect Dropbox')}
-        <div class="faint sync-hint">Dropbox opens, you allow access, then copy the code it shows back into this app.</div>`;
-    } else {
-      body = `<button class="btn" id="dbxConnect">${expired ? 'Reconnect Dropbox' : 'Connect Dropbox'}</button>
-        ${codeLink('link-btn', 'dbxUseCode', 'Having trouble? Use a code instead')}`;
-    }
-    return `<div class="sync-line"><span class="sync-dot-inline s-${expired ? 'error' : 'signedout'}" aria-hidden="true"></span><b>${expired ? 'Dropbox sign-in expired' : 'Dropbox sync is off'}</b></div>
-      <div class="faint" style="margin-bottom:12px">Connect once on each device (phone, PC…) and your log stays in step automatically. What's already on this device is kept and merged — nothing is overwritten.</div>
-      ${body}`;
+  if (!st.connected) {
+    return `<div class="sync-line"><span class="sync-dot-inline s-signedout" aria-hidden="true"></span><b>GitHub sync is off</b></div>
+      <div class="faint" style="margin-bottom:10px">Your log is saved on this device. Connect once per browser (phone, PC…) and it stays in step automatically as Markdown files in your private <b>${esc(repoName())}</b> repo, where Claude can read <code>lift/COACH.md</code>. What's already here is kept and merged — nothing is overwritten.</div>
+      ${tokenFormHTML(false)}`;
   }
   const label = SYNC_LABEL[st.state] || 'Connected';
-  const err = st.state === 'error' && st.lastError ? `<div class="sync-err">${esc(st.lastError)}</div>` : '';
+  const tokenTrouble = st.state === 'error' && ['auth', 'forbidden', 'notfound'].includes(st.lastErrorKind);
+  const err = st.lastError && (st.state === 'error' || (st.state === 'offline' && st.lastError !== label)) ? `<div class="sync-err">${esc(st.lastError)}</div>` : '';
+  const warn = st.warnings.length
+    ? `<div class="sync-warn">${st.warnings.length} file${st.warnings.length > 1 ? 's' : ''} in the repo couldn't be read and ${st.warnings.length > 1 ? 'were' : 'was'} left untouched: ${st.warnings.map(p => `<code>${esc(p)}</code>`).join(', ')}</div>` : '';
   return `<div class="sync-line"><span class="sync-dot-inline s-${esc(st.state)}" aria-hidden="true"></span><b>${label}</b>
       <span class="faint sync-when">Last synced: ${agoText(st.lastSyncedAt)}</span></div>
-    ${err}
-    <div class="faint sync-path">Dropbox: ${esc((st.pathMode === 'root' ? DROPBOX_TEAM_PREFIX : '') + DROPBOX_DATA_PATH)}</div>
-    <div class="faint sync-path">Apple Watch workouts import automatically from ${esc(DROPBOX_WATCH_PATH.split('/').pop())}.</div>
+    ${err}${warn}${st.notice ? `<div class="sync-warn">${esc(st.notice)}</div>` : ''}
+    <div class="faint sync-path">Repo: <a class="link" href="${esc(st.repoUrl)}" target="_blank" rel="noopener">${esc(repoName())}/${esc(GITHUB_PREFIX.replace(/\/$/, ''))}</a> · this device: ${esc(st.device)}</div>
+    <div class="faint sync-path">Apple Watch: files your shortcut uploads to <code>lift/inbox/</code> import automatically.</div>
+    ${tokenTrouble ? `<div style="margin-top:12px">${tokenFormHTML(true)}</div>` : ''}
     <div class="btn-row" style="margin-top:12px">
-      <button class="btn-ghost" id="dbxSignOut">Sign out</button>
-      <button class="btn secondary" id="dbxSyncNow" style="flex:2" ${st.state === 'syncing' ? 'disabled' : ''}>${st.state === 'syncing' ? 'Syncing…' : 'Sync now'}</button>
+      <button class="btn-ghost" id="ghDisconnect">Disconnect</button>
+      <button class="btn secondary" id="ghSyncNow" style="flex:2" ${st.state === 'syncing' ? 'disabled' : ''}>${st.state === 'syncing' ? 'Syncing…' : 'Sync now'}</button>
     </div>`;
 }
 function wireSyncCard() {
-  if (!sync) return;
   const on = (id, fn) => { const el = $('#' + id); if (el) el.onclick = fn; };
-  view.querySelectorAll('[data-codelink]').forEach(a => a.onclick = ev => {
-    if (!codeUrl) { ev.preventDefault(); prepareCodeUrl(); return toast('One moment — try again.'); }
-    // let the link open Dropbox in a new tab/Safari, then show the paste box here
-    setTimeout(() => { sync.markCodeOpened(); const box = $('#dbxCode'); if (box) box.focus(); }, 0);
-  });
-  on('dbxConnect', async () => {
-    try { await sync.beginRedirect(); } catch (e) { toast(e.message); }
-  });
-  on('dbxCodeCancel', () => { sync.cancelCode(); codeUrl = null; prepareCodeUrl(); paintSync(); });
-  on('dbxCodeSubmit', async () => {
-    const code = ($('#dbxCode').value || '').trim();
-    if (!code) return toast('Paste the code from Dropbox first.');
-    const btn = $('#dbxCodeSubmit'); btn.disabled = true; btn.textContent = 'Connecting…';
-    try { $('#dbxCode').blur(); } catch (e) {}
+  on('ghConnect', async () => {
+    const box = $('#ghToken'), btn = $('#ghConnect'), errEl = $('#ghErr');
+    const token = (box.value || '').trim();
+    errEl.textContent = '';
+    if (!token) { errEl.textContent = 'Paste your GitHub token first.'; box.focus(); return; }
+    const label = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Checking…';
+    try { box.blur(); } catch (e) {}
     try {
-      const pending = sync.completeCode(code);
-      await pending; codeUrl = null;
-      paintSync(); toast('Dropbox connected.');
+      const r = await sync.connect(token);
+      box.value = '';
+      paintSync(true);
+      toast(String(r).indexOf('error') === 0 ? 'Connected — but the first sync hit a problem (see Sync).' : 'Connected to GitHub.');
     } catch (e) {
-      btn.disabled = false; btn.textContent = 'Connect';
-      toast(e.kind === 'network' ? 'No connection — try again.' : 'That code didn\'t work — open Dropbox again for a new one.');
+      const nb = $('#ghConnect'), ne = $('#ghErr');
+      if (nb) { nb.disabled = false; nb.textContent = label; }
+      if (ne) ne.textContent = e.message || 'That didn\'t work — try again.';
     }
   });
-  on('dbxSyncNow', () => sync.syncNow('manual'));
-  on('dbxSignOut', () => confirmModal('Sign out of Dropbox?', 'Sync stops on this device. Everything logged here stays here, and your Dropbox copy is untouched.', async () => {
-    await sync.signOut(); codeUrl = null; prepareCodeUrl(); render(); toast('Signed out of Dropbox.');
-  }));
+  const box = $('#ghToken');
+  if (box) box.onkeydown = ev => { if (ev.key === 'Enter') { ev.preventDefault(); $('#ghConnect').click(); } };
+  on('ghSyncNow', () => sync.syncNow('manual'));
+  on('ghDisconnect', () => confirmModal('Disconnect GitHub?',
+    'Sync stops in this browser — for Guitar Studio too, since both apps share the token. Everything logged here stays here, and the repo is untouched.',
+    () => { sync.disconnect(); render(); toast('Disconnected.'); }));
 }
 // Repaint the header dot and (if visible) the sync card — never the whole view.
-function paintSync() {
+function paintSync(force) {
+  if (!sync) return;
+  const st = sync.getStatus();
   const dot = $('#syncDot');
   if (dot) {
-    const st = sync ? sync.getStatus() : { state: 'unconfigured' };
-    dot.classList.toggle('hidden', !sync);
+    dot.classList.remove('hidden');
     [...dot.classList].filter(c => c.indexOf('s-') === 0).forEach(c => dot.classList.remove(c));
     dot.classList.add('s-' + st.state);
     const label = SYNC_LABEL[st.state] || 'Sync';
@@ -1403,27 +1327,20 @@ function paintSync() {
   }
   const card = $('#syncCard');
   if (card) {
-    // don't wipe a half-typed code
-    const stillPasting = sync && !sync.signedIn() && sync.getStatus().pendingCode;
-    const typing = stillPasting && document.activeElement && document.activeElement.id === 'dbxCode';
-    if (!typing) {
-      const box = $('#dbxCode'), kept = box ? box.value : '';
-      card.innerHTML = syncCardHTML(); wireSyncCard();
-      const nb = $('#dbxCode'); if (nb && kept) nb.value = kept;
-    }
+    // don't wipe a token being pasted
+    const box = $('#ghToken');
+    if (force !== true && box && (box.value || document.activeElement === box)) return;
+    const open = card.querySelector('details.sync-howto');
+    const wasOpen = open ? open.open : null;
+    card.innerHTML = syncCardHTML(); wireSyncCard();
+    const nd = card.querySelector('details.sync-howto');
+    if (nd && wasOpen !== null) nd.open = wasOpen;
   }
 }
 
-// Adopt a merged state (from Dropbox or a merged backup import) and repaint carefully.
+// Re-render unless TJ is typing in a field (then wait until he leaves it).
 let renderDeferred = false;
-function applyMerged(merged, fromImport) {
-  S = merged;
-  coachReportCache = null;
-  applyingRemote = !fromImport;
-  try { save(); } finally { applyingRemote = false; }
-  if (!S.active) { openLogger = null; if (rest.endAt) endRest(false); }
-  else if (openLogger && !S.active.entries[openLogger.exId]) openLogger = null;
-  // re-rendering would wipe a field TJ is typing in: wait until he leaves it
+function renderSafely() {
   const a = document.activeElement;
   if (a && view.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) {
     if (!renderDeferred) {
@@ -1435,44 +1352,49 @@ function applyMerged(merged, fromImport) {
     }
   } else render();
 }
+// Adopt a merged state (from GitHub or a merged backup import) and repaint carefully.
+function applyMerged(merged, fromImport) {
+  S = merged;
+  coachReportCache = null;
+  applyingRemote = !fromImport;
+  try { save(); } finally { applyingRemote = false; }
+  if (!S.active) { openLogger = null; if (rest.endAt) endRest(false); }
+  else if (openLogger && !S.active.entries[openLogger.exId]) openLogger = null;
+  renderSafely();
+}
 
 function initSync() {
-  if (typeof DROPBOX_APP_KEY === 'undefined' || !DROPBOX_APP_KEY) { paintSync(); return; }
-  sync = LiftDropbox.create({
-    appKey: DROPBOX_APP_KEY,
-    storageKey: LS_KEY.replace(/\.v1$/, '') + '.dropbox',
-    dataPath: DROPBOX_DATA_PATH,
-    watchPath: DROPBOX_WATCH_PATH,
-    checkFolder: DROPBOX_CHECK_FOLDER,
-    teamPrefix: DROPBOX_TEAM_PREFIX,
+  sync = LiftGitHub.create({
+    owner: GITHUB_OWNER, repo: GITHUB_REPO, branch: GITHUB_BRANCH, prefix: GITHUB_PREFIX, appName: 'lift',
+    tokenKey: GITHUB_TOKEN_KEY,
+    storageKey: LS_KEY.replace(/\.v1$/, '') + '.github',
+    deviceKey: LS_KEY.replace(/\.v1$/, '') + '.deviceId',
     getState: () => S,
     applyState: merged => applyMerged(merged, false),
     normalize,
     merge: (a, b) => LiftMerge.mergeStates(a, b, { seed: SEED_PROGRAM }),
     canSync: () => !loadProblem && !saveFailed,
     isBusy: () => !!(modalOpts && !modalOpts.dismissable), // finish-workout sheets
-    importWatch: text => {
-      const parsed = parseWatchFile(String(text || ''));
-      if (!parsed.length) return 0;
-      const { added } = mergeWatchEntries(parsed);
-      if (added) { render(); toast(`Imported ${added} Apple Watch workout${added > 1 ? 's' : ''}.`); }
-      return added;
+    // Apple Watch files the iOS Shortcut dropped in lift/inbox/
+    importInbox: text => {
+      const parsed = parseWatchFile(text);
+      if (!parsed.length) return { parsed: 0, added: 0 };
+      const { added } = LiftWatch.mergeInto(S, parsed);
+      if (added) {
+        coachReportCache = null;
+        applyingRemote = true;
+        try { save(); } finally { applyingRemote = false; }
+        setTimeout(renderSafely, 0);
+        toast(`Imported ${added} Apple Watch workout${added > 1 ? 's' : ''}.`);
+      }
+      return { parsed: parsed.length, added };
     },
-    onStatus: paintSync,
-    // redirect flow: plain navigation (the code flow uses a real link, see prepareCodeUrl)
-    openUrl: url => { location.assign(url); },
+    coachMarkdown: () => { coachReportCache = null; return coachReport(); },
+    onStatus: () => paintSync(),
   });
   paintSync();
-  prepareCodeUrl();
   sync.attach(window, document);
-  sync.handleRedirect(location.href).then(r => {
-    if (r.handled) {
-      try { history.replaceState(null, '', r.cleanUrl); } catch (e) {}
-      if (r.ok) { toast('Dropbox connected.'); tab = 'coach'; render(); }
-      else if (r.message) toast(r.message);
-    }
-    return sync.syncNow(r.handled ? 'signin' : 'load');
-  });
+  sync.syncNow('load');
 }
 
 

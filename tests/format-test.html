@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lift Studio — file format tests</title>
+<style>
+  body { font: 14px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; background: #0e1116; color: #e8ecf2; margin: 16px; }
+  h1 { font-size: 1.1rem; }
+  #summary { font-weight: 800; margin: 8px 0 14px; }
+  table { border-collapse: collapse; width: 100%; }
+  td { border-bottom: 1px solid #2a3342; padding: 6px 8px; vertical-align: top; }
+  .pass { color: #4cc38a; font-weight: 700; } .fail { color: #e5645f; font-weight: 700; }
+  code, pre { color: #97a3b4; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+</style>
+</head>
+<body>
+<h1>Lift Studio — Markdown file format tests (lift-md.js)</h1>
+<div id="summary">running…</div>
+<table id="results"></table>
+<h2 style="font-size:1rem">Sample workout file</h2>
+<pre id="sample"></pre>
+
+<script src="../program.js"></script>
+<script src="../sync-merge.js"></script>
+<script src="../state.js"></script>
+<script src="../lift-md.js"></script>
+<script>
+'use strict';
+const C = LiftMerge.canonical;
+const clone = v => JSON.parse(JSON.stringify(v));
+const cases = [];
+const test = (name, fn) => cases.push({ name, fn });
+function assert(c, msg) { if (!c) throw new Error(msg || 'assertion failed'); }
+function eqJ(a, b, msg) { if (C(a) !== C(b)) throw new Error((msg || 'not equal') + '\n  got:  ' + C(a).slice(0, 300) + '\n  want: ' + C(b).slice(0, 300)); }
+
+const NASTY = 'Café “quoted” \'single\' "double" \\ back\\slash\nline two\r\nline three\t tab | pipe ```fence``` ## Data 💪🏽 日本語   end';
+const ctx = normalize(freshState());
+function workout() {
+  return {
+    id: 'smk2x9qlm1abc', day: 'push', date: '2026-09-27', minutes: 52, updatedAt: 1790000000123,
+    bodyCheck: 'tight', bodyNote: NASTY,
+    entries: {
+      bench: { target: 140, sets: [
+        { reps: 8, weight: 140, effort: 'solid', note: '', t: 1789999000000 },
+        { reps: 7, weight: 140, effort: 'grind', note: NASTY, t: 1789999100000 } ] },
+      plank: { target: 0, sets: [{ reps: 60, weight: 0, effort: 'easy', note: '', t: 1789999200000 }] },
+      'bx-pull-ups': { target: 0, sets: [{ reps: 9, weight: 0, effort: 'solid', note: 'kipping? no', t: 1789999300000 }] },
+    },
+    suggestions: [{ exId: 'bench', kind: 'up', to: 145, applied: false }],
+    futureField: { nested: [1, 'two', null, true] },
+  };
+}
+const cardio = () => ({ id: 'cw-0a1b2c3d4e5f60', date: '2026-09-20', kind: 'Hoops', minutes: 62, distance: '', note: NASTY, hr: 142, cal: 480, source: 'watch', wkey: '2026-09-20|Hoops|62', updatedAt: 1789900000000 });
+
+test('workout: record -> markdown -> record is lossless (unicode, quotes, newlines, fences, pipes)', () => {
+  const r = workout();
+  const md = LiftMd.serialize('sessions', r, ctx);
+  eqJ(LiftMd.parse(md), r);
+  assert(JSON.stringify(LiftMd.parse(md)) === JSON.stringify(LiftMd.sortKeys(r)), 'byte-exact json');
+});
+test('cardio, settings, active: lossless round trips', () => {
+  const c = cardio();
+  eqJ(LiftMd.parse(LiftMd.serialize('cardio', c, ctx)), c);
+  const st = normalize(freshState());
+  st.settings.barWeight = 35; st.settingsTs.barWeight = 1700000000000;
+  st.exercises.push({ id: 'bx-farmer', day: null, bonus: true, name: 'Farmer “carry” | heavy', type: 'dumbbell', loadLabel: 'per DB', sets: 3, repLow: 1, repHigh: 99, weight: 50, increment: 2.5, fieldTs: { name: 5 }, updatedAt: 5 });
+  st.events.push({ id: 'e1', updatedAt: 9, date: '2026-09-01', exId: 'bench', kind: 'up', from: 135, to: 140 });
+  st.tombstones.sessions.push({ id: 'gone', deleted: true, updatedAt: 3 });
+  const b = LiftMd.settingsBundle(st);
+  eqJ(LiftMd.parse(LiftMd.serialize('settings', b, st)), b);
+  const a = { active: { id: 'w1', day: 'legs', date: '2026-09-28', startedAt: 1790001000000, entries: { squat: { target: 135, sets: [{ reps: 8, weight: 135, effort: 'solid', note: NASTY, t: 1 }] } } }, activeUpdatedAt: 1790001000500 };
+  eqJ(LiftMd.parse(LiftMd.serialize('active', a, st)), a);
+});
+test('deterministic: key order / repeated calls give identical bytes', () => {
+  const r = workout();
+  const shuffled = {}; Object.keys(r).reverse().forEach(k => { shuffled[k] = r[k]; });
+  const a = LiftMd.serialize('sessions', r, ctx), b = LiftMd.serialize('sessions', shuffled, ctx);
+  assert(a === b && a === LiftMd.serialize('sessions', clone(r), ctx));
+});
+test('frontmatter: flat scalars only, with id/type/date/updatedAt', () => {
+  const md = LiftMd.serialize('sessions', workout(), ctx);
+  const m = /^---\n([\s\S]*?)\n---\n/.exec(md);
+  assert(m, 'has frontmatter');
+  const lines = m[1].split('\n');
+  lines.forEach(l => assert(/^[A-Za-z]+: [^\n]+$/.test(l) && !/: [\[{|>]/.test(l), 'flat scalar: ' + l));
+  const keys = lines.map(l => l.split(':')[0]);
+  ['id', 'type', 'date', 'updatedAt'].forEach(k => assert(keys.includes(k), 'has ' + k));
+  assert(lines.includes('type: workout') && lines.includes('date: 2026-09-27') && lines.includes('updatedAt: ' + new Date(1790000000123).toISOString()), m[1]);
+  // a day name that YAML would misread gets quoted
+  const s2 = workout(); s2.day = 'odd';
+  const c2 = normalize(freshState()); c2.days.push({ id: 'odd', name: 'yes: no #1', updatedAt: 0 });
+  assert(/\nday: "yes: no #1"\n/.test(LiftMd.serialize('sessions', s2, c2)), 'quoted');
+});
+test('body is human-readable: table, notes on one line, neck check, progression', () => {
+  const md = LiftMd.serialize('sessions', workout(), ctx);
+  assert(md.includes('# Push — Sun Sep 27, 2026'), 'title');
+  assert(md.includes('| Barbell Bench Press (target 140 lb) | 1 | 8 | 140 lb | solid |'), 'set row');
+  assert(md.includes('| Front Plank | 1 | 60 s | — | easy |'), 'timed row');
+  assert(md.includes('**Neck/shoulders:** tight'), 'neck');
+  assert(md.includes('- Barbell Bench Press: move up to 145 lb — not yet'), 'progression');
+  const body = md.slice(0, md.lastIndexOf('\n## Data\n'));
+  assert(!/\n## Data\n/.test(body), 'user text cannot fake a Data heading');
+  body.split('\n').filter(l => l.startsWith('|')).forEach(l => assert(/\|\s*$/.test(l), 'table row intact: ' + l));
+});
+test('Windows line endings / BOM (edited in Notepad) still parse', () => {
+  const r = workout();
+  const md = '﻿' + LiftMd.serialize('sessions', r, ctx).replace(/\n/g, '\r\n');
+  eqJ(LiftMd.parse(md), r);
+});
+test('the json block is found even if a human edits the body above it', () => {
+  const r = cardio();
+  let md = LiftMd.serialize('cardio', r, ctx);
+  md = md.replace('# Hoops', '# Hoops (great game!)\n\nExtra notes typed in Obsidian.\n\n```json\n{"not":"this"}\n```\n');
+  eqJ(LiftMd.parse(md), r);
+});
+test('corrupt files throw (never parsed as garbage)', () => {
+  const bad = ['', 'hello', '## Data\nno fence', '## Data\n```json\n{ nope\n```', '## Data\n```json\n[1,2]\n```', '## Data\n```json\n{"a":1}\n'];
+  bad.forEach(t => { let threw = false; try { LiftMd.parse(t); } catch (e) { threw = true; } assert(threw, 'should throw: ' + JSON.stringify(t)); });
+  let threw = false;
+  try { LiftMd.parseAs('sessions', '## Data\n```json\n{"date":"2026-01-01"}\n```\n'); } catch (e) { threw = true; }
+  assert(threw, 'session without id rejected');
+  threw = false;
+  try { LiftMd.parseAs('settings', '## Data\n```json\n{"x":1}\n```\n'); } catch (e) { threw = true; }
+  assert(threw, 'settings shape checked');
+});
+test('paths: lowercase YYYY-MM-DD-<slug>-<id>.md, prefix lift/', () => {
+  const p = LiftMd.pathFor('sessions', workout());
+  assert(p === 'lift/workouts/2026-09-27-push-smk2x9qlm1abc.md', p);
+  const c = LiftMd.pathFor('cardio', cardio());
+  assert(c === 'lift/cardio/2026-09-20-hoops-cw-0a1b2c3d4e5f60.md', c);
+  const weird = LiftMd.pathFor('cardio', { id: 'AbC/../x', date: 'bad', kind: 'Café Run!' });
+  assert(/^lift\/cardio\/undated-cafe-run-abc-x-[0-9a-f]{6}\.md$/.test(weird), weird);
+  assert(LiftMd.shortId('AB') !== LiftMd.shortId('ab'), 'case-distinct ids stay distinct');
+  assert(LiftMd.pathFor('settings') === 'lift/settings.md' && LiftMd.pathFor('active') === 'lift/active.md');
+  assert(LiftMd.kindOfPath('lift/inbox/watch-2026-09-28.CSV') === 'inbox' && LiftMd.kindOfPath('lift/COACH.md') === null && LiftMd.kindOfPath('guitar/x.md') === null && LiftMd.kindOfPath('lift/workouts/.gitkeep') === null);
+});
+test('pretty dates are locale-independent', () => {
+  assert(LiftMd.prettyDate('2026-02-28') === 'Sat Feb 28, 2026' && LiftMd.prettyDate('2024-02-29') === 'Thu Feb 29, 2024');
+});
+test('active view drops the device-local rest timer', () => {
+  const st = normalize(freshState());
+  st.active = { id: 'w', day: 'push', date: '2026-09-28', startedAt: 1, entries: {}, restEndAt: 99, restTotal: 90 };
+  const b = LiftMd.activeBundle(st);
+  assert(!('restEndAt' in b.active) && !('restTotal' in b.active) && st.active.restEndAt === 99);
+  assert(LiftMd.activeBundle(normalize(freshState())) === null);
+});
+
+// ---------- run
+const rows = []; let pass = 0;
+cases.forEach(c => {
+  let ok = true, err = '';
+  try { c.fn(); } catch (e) { ok = false; err = e.message; console.error(c.name, e); }
+  if (ok) pass++;
+  rows.push(`<tr><td class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</td><td>${c.name}${err ? `<br><code>${err.replace(/</g, '&lt;')}</code>` : ''}</td></tr>`);
+});
+document.getElementById('results').innerHTML = rows.join('');
+const sum = document.getElementById('summary');
+sum.textContent = `${pass}/${cases.length} passed`;
+sum.className = pass === cases.length ? 'pass' : 'fail';
+const sample = workout(); sample.bodyNote = 'Left trap a bit tight after bench.'; sample.entries.bench.sets[1].note = 'last rep slow';
+delete sample.futureField;
+document.getElementById('sample').textContent = LiftMd.serialize('sessions', sample, ctx);
+window.__formatResults = { pass, total: cases.length };
+</script>
+</body>
+</html>

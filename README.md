@@ -25,9 +25,7 @@ while ($l.IsListening) { $c = $l.GetContext(); $p = $c.Request.Url.AbsolutePath.
 ```
 
 Run it from the repo folder (`powershell -ExecutionPolicy Bypass -File path\to\serve.ps1`),
-then open http://127.0.0.1:8766. (With Python: `python -m http.server 8766`.) For Dropbox
-sign-in locally, use `http://localhost:<port>/` and add that exact URL to the Dropbox
-app's Redirect URIs.
+then open http://127.0.0.1:8766. (With Python: `python -m http.server 8766`.)
 
 ### Add to iPhone home screen
 
@@ -45,82 +43,96 @@ the precache list.
 ### Your data
 
 Each device (home-screen app, Safari, desktop browser) keeps its own copy in
-`localStorage` (key `liftstudio.v1`) and works fully offline. **Dropbox sync** (below) keeps
+`localStorage` (key `liftstudio.v1`) and works fully offline. **GitHub sync** (below) keeps
 those copies in step automatically. Without sync, **Coach → Manual backup → Export JSON /
 Import JSON** still moves data by hand (on the home-screen app, Export opens the share
 sheet). With sync on, Import *merges* a backup instead of replacing, and Reset asks before
 wiping every device.
 
-## Dropbox sync
+## GitHub sync
 
-Local-first, automatic, no server. Every device signs in to Dropbox once; after that the
-app syncs one JSON file, `/TJ/Fitness/Lift Studio/lift-studio-data.json`:
+Local-first, automatic, no server. Your log syncs to Markdown files in the **private**
+repo `tjmitch4/studio-data`, under `lift/` (Guitar Studio uses `guitar/` in the same repo).
+Obsidian can open the repo as a vault; Claude reads `lift/COACH.md`.
 
-- **When:** on launch, 2 s after every change, when the app comes back to the foreground,
-  when the network returns, and every 60 s while open. Offline is fine — changes wait
-  and go up on the next sync (the header dot turns grey, no alerts).
-- **How:** download → merge with this device → save locally → upload with Dropbox's
-  `rev` check. If another device uploaded in between (409 conflict), it re-downloads,
-  re-merges and retries (up to 3×).
+```
+lift/
+  workouts/2026-09-27-push-<id>.md   one per finished workout
+  cardio/2026-09-20-hoops-<id>.md    one per cardio/sport entry
+  settings.md                        settings, program targets, bonus lifts, progression events
+  active.md                          the workout in progress (continue it on another device)
+  COACH.md                           the Coach Report, rewritten whenever data changes
+  inbox/                             Apple Watch hand-off (see watch-sync.md)
+```
+
+Each file has flat YAML frontmatter (Obsidian properties), a readable body, and the full
+record in a final `## Data` json block. **The app reads only that json block** — editing
+the body or frontmatter by hand is harmless but gets rewritten the next time that record
+changes in the app. A file the app can't parse is skipped with a warning in the Sync card,
+never deleted or overwritten. Filenames never change for the life of a record.
+
+- **When:** on launch, 5 s after each change (≈20 s when only the in-progress workout
+  changed, and right away when the app goes to the background), when the app comes back
+  to the foreground, when the network returns, and every 2 min while open. Offline is fine
+  — changes wait and go up later (grey dot, no alerts). Rate limits and network errors
+  back off and retry silently.
+- **How (one commit per sync, Git Data API):** read the branch head and tree → download
+  only files that changed since this device's last sync → merge → write the changed files
+  plus deletions as one commit (`lift: sync (3 changed) from iPhone-k3f9`) → move `main`
+  with `force: false`. If another device committed in between, it starts over (max 3×).
+  An idle device makes no commits.
 - **Merge rules** (`sync-merge.js`, tested by `tests/merge-test.html`): workouts, cardio
-  entries and progression events merge by id — newest edit wins, deletes are kept as
-  tombstones so they reach other devices. Settings and each exercise's targets merge
-  **per field** (change bench weight on the phone and a rest time on the PC — both
-  survive). The in-progress workout: newest wins; one finished on another device closes
-  here too. A first sync never loses anything: a phone with history + a PC with different
-  history end up with the union.
-- **Apple Watch:** each sync checks `/TJ/Fitness/watch-workouts.csv` (written by the
-  *Sync Workouts* shortcut, see `watch-sync.md`); when it changes, new workouts are
-  imported automatically, deduped, and deleted ones stay deleted.
-- **Header dot:** green synced · blue syncing · grey offline · red problem · amber ring
-  not connected. Tap it for the Sync card on the Coach tab (connect, *Sync now*, sign out).
-  Signing out revokes the token and keeps everything on the device.
+  entries and progression events merge by id — newest edit wins, app deletes are kept as
+  tombstones (in `settings.md`) so they reach every device. Settings and each exercise's
+  targets merge **per field**. The in-progress workout: newest wins; one finished or
+  discarded on another device closes here too. A first sync never loses anything.
+- **Deleting files by hand** (GitHub web, Obsidian): a record whose file disappears is
+  removed on the next sync, unless it was edited on that device since its last sync (then
+  it comes back). Safety net: if `settings.md` disappears, or more than 3 records and more
+  than a quarter of the files vanish at once, sync treats it as a wiped/recreated repo —
+  nothing is deleted locally and everything is re-uploaded.
+- **Apple Watch:** any `.csv`/`.json` the *Sync Workouts* shortcut puts in `lift/inbox/`
+  is imported (deduped; deleted entries stay deleted) and removed in the same commit.
+- **Header dot:** green synced · blue syncing · grey offline · red problem · amber ring not
+  connected. Tap it for the Sync card on the Coach tab (connect, *Sync now*, disconnect).
 
-### Setting up the Dropbox app (once — shared with Guitar Studio)
+### Connecting (once per browser)
 
-1. https://www.dropbox.com/developers/apps → **Create app** → *Scoped access* →
-   **Full Dropbox** (the data lives in your existing `/TJ/Fitness` folder, not an app
-   folder) → name it e.g. *TJ Studio Sync*.
-2. **Permissions** tab: tick `files.metadata.read`, `files.content.read`,
-   `files.content.write` (`account_info.read` is always on — used to find the team root
-   if needed). Click **Submit**.
-3. **Settings** tab:
-   - **OAuth 2 → Allow public clients (Implicit Grant & PKCE): Allow.**
-   - **Redirect URIs** — add all of these:
-     - `https://tjmitch4.github.io/lift-studio/`
-     - `https://tjmitch4.github.io/guitar-studio/`
-     - `http://localhost:8781/` (and any other local port you test on, e.g.
-       `http://localhost:8766/`, plus whatever Guitar Studio uses locally)
-   - Copy the **App key** (not the secret — PKCE needs no secret).
-4. Paste the key into `config.js`: `const DROPBOX_APP_KEY = 'xxxxxxxxxxxxxxx';`, commit,
-   push. (The app key is public by design; never commit the app secret.)
-5. On each device: Coach tab → **Connect Dropbox** → allow. On the iPhone **home-screen
-   app**, the button opens Dropbox in Safari and shows a code — copy it, switch back, paste
-   it into *Paste the code from Dropbox*. (A redirect from Dropbox would land in Safari,
-   not the home-screen app, so the app uses the no-redirect code flow there.) *Having
-   trouble? Use a code instead* offers the same flow in any browser.
+The app authenticates with a **fine-grained personal access token** limited to
+`studio-data`. It's stored in `localStorage` under `studioData.githubToken` — the same key
+Guitar Studio uses, and both apps live on `tjmitch4.github.io`, so one paste per browser
+covers both (the iPhone home-screen app counts as its own browser). The token is only ever
+sent to `api.github.com` in the `Authorization` header — never logged, never in a URL.
 
-While the app is still in Dropbox's *development* status it allows up to 500 users — plenty.
+1. Open https://github.com/settings/personal-access-tokens/new
+2. **Token name:** `Studio apps`. **Expiration:** your call (when it expires, the Sync card
+   turns red and asks for a new one; nothing is lost meanwhile).
+3. **Resource owner:** `tjmitch4`. **Repository access:** *Only select repositories* →
+   `studio-data`.
+4. **Permissions → Repository permissions → Contents: Read and write.** (GitHub adds
+   *Metadata: Read-only* automatically.) Nothing else.
+5. **Generate token**, copy it.
+6. In the app: Coach tab → Sync → paste → **Connect**. The app checks the token can see
+   `studio-data` and push to it, then syncs. Errors say exactly what to fix (wrong/expired
+   token, repo not selected, read-only).
 
-**Paths.** TJ's Dropbox is a Business team account; his member folder is the API's home
-namespace, so `/TJ/Fitness/...` resolves directly. On first sync the app checks that
-`/TJ/Fitness` exists; if not, it looks up the team root namespace and retries with the
-`Dropbox-API-Path-Root` header and a `/TJ Mitchell` prefix. Whichever works is cached (the
-Sync card shows the path in use). All paths are constants in `config.js`.
-
-**Tokens** live in `localStorage` under `liftstudio.dropbox` (refresh token; access tokens
-auto-refresh). Nothing about sync is ever sent anywhere but Dropbox.
+**Disconnect** removes the token from that browser (Guitar Studio stops syncing there too)
+and keeps all local data; the repo is untouched.
 
 ### Testing sync locally
 
-- `tests/merge-test.html` — the merge rules (disjoint devices, same record edited on both,
-  delete vs edit, old data without ids/timestamps, settings, seeded program, first sync…).
-- `tests/sync-test.html` — the whole engine against an in-memory mock Dropbox with two
-  simulated devices: sign-in URLs, first sync, two-device merge, 409 retry, offline →
-  online, watch CSV import, team-root path fallback, token refresh/revocation, sign out.
+- `tests/merge-test.html` — the merge rules.
+- `tests/format-test.html` — the Markdown format: lossless round trips (unicode, quotes,
+  newlines, fences, pipes), deterministic output, flat frontmatter, corrupt-file handling.
+- `tests/sync-test.html` — the whole engine against an in-memory mock of the GitHub API
+  (`tests/mock-github.js`) with simulated devices: connect errors, first sync, convergence,
+  remote/local deletes, edit vs delete, non-fast-forward retry, corrupt files, watch inbox,
+  active-workout hand-off, idle = no commit, offline/rate limits, wiped-repo safety.
 
-Open either from the local server (e.g. http://localhost:8781/tests/merge-test.html);
-every row should say PASS.
+Open them from a local server (e.g. http://localhost:8783/tests/sync-test.html); every row
+should say PASS. No token needed. To try the real app against the mock, load `index.html`,
+then in the console: load `tests/mock-github.js`, `const m = mockGitHub(); window.fetch =
+m.install(window.fetch.bind(window));` and connect with the token `GOOD`.
 
 ## What it does
 
@@ -141,12 +153,14 @@ every row should say PASS.
   days (program note: reassess as you go); flows into the coach report.
 - **Progress tab** — per-exercise weight chart, working/best/est-1RM stats, full history.
 - **Cardio tab** — Hoops/Tennis/Row/Run/Walk logging with a gentle conditioning-mix nudge,
-  plus Apple Watch import (see `watch-sync.md`): with Dropbox sync on, the CSV a Shortcuts
-  automation saves to Dropbox is imported automatically; without it, pick the file (or
-  Health Auto Export JSON) via the iOS file picker. Maps Health types to app kinds, keeps
+  plus Apple Watch import (see `watch-sync.md`): with GitHub sync on, the export the
+  *Sync Workouts* shortcut uploads to `lift/inbox/` is imported automatically; without it,
+  pick the file (or Health Auto Export JSON) via the iOS file picker. Maps Health types to app kinds, keeps
   avg HR + calories, dedupes against prior imports and manual entries.
-- **Coach tab** — one-tap markdown Coach Report (targets, recent sessions, progression
-  events, cardio, auto-flags for stalls/grinds/pain) to paste to Claude; Dropbox sync;
+- **Coach tab** — the Coach Report (program rules, targets with last results, recent
+  sessions, progression events, 4-week rhythm, cardio, auto-flags for stalls/grinds/pain).
+  With sync on, Claude reads it as `lift/COACH.md` in `studio-data`; a copy button remains
+  for pasting. Also: GitHub sync card;
   settings (bar weight, plate inventory, rest times); manual JSON backup.
 
 ## Files
@@ -154,13 +168,15 @@ every row should say PASS.
 - `index.html` — shell, tab bar, rest-timer bar
 - `styles.css` — dark, mobile-first
 - `program.js` — `SEED_PROGRAM`: TJ's split, weights, increments, settings defaults
-- `config.js` — Dropbox app key + sync paths
+- `config.js` — GitHub repo + token key constants
 - `state.js` — state shape, `normalize()` load/import migration (schema v3)
 - `sync-merge.js` — pure merge of two states (no DOM/network)
-- `dropbox-sync.js` — Dropbox OAuth (PKCE) + sync engine
+- `lift-md.js` — Markdown file format: record ⇄ file, paths (pure)
+- `github-sync.js` — GitHub sync engine (Git Data API, one commit per sync)
+- `watch-import.js` — Apple Watch / Health export parser + dedupe (pure)
 - `app.js` — progression logic, rendering, coach report, sync UI
-- `sw.js` — service worker (network-first offline cache; never touches Dropbox calls)
-- `tests/` — merge + sync engine test pages
+- `sw.js` — service worker (network-first offline cache; never touches api.github.com)
+- `tests/` — merge, file-format and sync-engine test pages + GitHub API mock
 - `manifest.webmanifest`, `icons/` — home-screen install metadata + icons
 
 Storage key: `liftstudio.v1`. Seed merges forward: new exercises added to `program.js`
@@ -171,6 +187,5 @@ deterministic content-hash id, so the same old record on two devices doesn't dup
 
 ## Planned
 
-- Auto-sync workout logs into the Obsidian vault (`_Projects/Fitness Coach & Tracker.md`
-  living-document plan) so Claude reads history without a manual copy step. (Claude can
-  already read the synced JSON straight from Dropbox.)
+- Point the Obsidian vault at a clone of `studio-data` (or add it as a vault) so workout
+  notes show up next to `_Projects/Fitness Coach & Tracker.md`.
